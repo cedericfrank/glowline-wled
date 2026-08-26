@@ -1,0 +1,5 @@
+{
+  "name": "glowline",
+  "build": { "libArchive": false },
+  "dependencies": {}
+}

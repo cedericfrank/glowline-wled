@@ -1,0 +1,9 @@
+# Local override: build esp32dev with the glowline usermod included.
+# See platformio_override.sample.ini for the full set of available overrides.
+
+[platformio]
+default_envs = esp32dev_glowline
+
+[env:esp32dev_glowline]
+extends = env:esp32dev
+custom_usermods = ${env:esp32dev.custom_usermods} glowline
