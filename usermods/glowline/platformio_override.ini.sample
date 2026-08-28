@@ -7,3 +7,16 @@ default_envs = esp32dev_glowline
 [env:esp32dev_glowline]
 extends = env:esp32dev
 custom_usermods = ${env:esp32dev.custom_usermods} glowline
+
+# ESP32-S3, 16MB flash + PSRAM, built on the pioarduino platform instead of the
+# default tasmota one. Use this env if you need wss:// (TLS): the tasmota
+# platform (and the official PlatformIO registry platform, which resolves to
+# the same tasmota-sourced package) ship mbedtls with TLS compiled out and no
+# NetworkClientSecure/WiFiClientSecure at all, while pioarduino ships a real,
+# working TLS stack. Confirmed to build full WLED (RAM 18.3%, Flash 58.0% on
+# a 16MB board) with glowline included.
+[env:esp32s3_glowline_pioarduino]
+extends = env:esp32s3dev_16MB_opi
+platform = ${esp32_idf_V5.platform_pioarduino}
+platform_packages = ${esp32_idf_V5.platform_packages_pioarduino}
+custom_usermods = ${env:esp32s3dev_16MB_opi.custom_usermods} glowline
