@@ -3,25 +3,38 @@
 #include <base64.h>
 #include "esp_log.h"
 
+#if __has_include(<WiFiClientSecure.h>)
+  #include <WiFiClientSecure.h>
+#else
+  #error "glowline needs a WiFiClientSecure/NetworkClientSecure-capable platform for wss:// -- e.g. pioarduino/platform-espressif32 (see usermods/glowline/platformio_override.ini.sample). The default tasmota-sourced espressif32 platform ships TLS compiled out."
+#endif
+
 /*
  * Minimal diagnostic usermod. Does not affect LED output or WLED state.
  *
  * - Prints a heartbeat and the current free heap to Serial every 5 seconds.
- * - Maintains a plaintext (ws://) WebSocket connection to
- *   ws://host:port/ws?device=<deviceId>&token=<token>, where host, port,
+ * - Maintains a TLS (wss://) WebSocket connection to
+ *   wss://host:port/ws?device=<deviceId>&token=<token>, where host, port,
  *   deviceId and token are all configurable in Settings -> Usermods (nothing
  *   hardcoded). Sends a hello message on connect, logs every message
  *   received, and reconnects with exponential backoff (1s doubling up to a
  *   60s cap) on disconnect. Every state transition is logged, and free heap
- *   is logged on connect.
+ *   is logged before, during and after the TLS handshake.
  *
- * The WebSocket client (handshake + RFC 6455 framing) is hand-rolled on top
- * of plain WiFiClient rather than using a third-party library: this
- * particular Arduino-ESP32 core build ships no TLS-capable client class at
- * all (no WiFiClientSecure/NetworkClientSecure header), and every WebSocket
- * client library available for it unconditionally includes one even when
- * only plaintext ws:// is needed. Revisit this once the core exposes a
- * usable TLS client and wss:// support is wanted.
+ * TLS is via setInsecure() -- the connection is encrypted but the server's
+ * certificate is NOT validated (no chain-of-trust check), so this is still
+ * vulnerable to a MITM presenting any certificate. That's known debt to
+ * replace with setCACert()/a pinned cert before this ships for real.
+ *
+ * The WebSocket client (handshake + RFC 6455 framing) is otherwise
+ * hand-rolled on top of the TCP client rather than using a third-party
+ * library, since every WebSocket client library available for this core
+ * unconditionally pulls in its own TLS assumptions. This only builds on
+ * platforms that actually ship a working WiFiClientSecure/NetworkClientSecure
+ * (see the #error above) -- confirmed working on pioarduino/platform-esp32,
+ * NOT on the tasmota-sourced platform (or the official PlatformIO registry
+ * platform, which resolves to the same tasmota source), both of which ship
+ * mbedtls with TLS compiled out.
  */
 class GlowlineUsermod : public Usermod {
   private:
@@ -35,8 +48,8 @@ class GlowlineUsermod : public Usermod {
     String wsDeviceId = "";
     String wsToken = "";
 
-    // TCP connection
-    WiFiClient client;
+    // TLS connection
+    WiFiClientSecure client;
 
     enum class WsState : uint8_t { DISCONNECTED, CONNECTING, CONNECTED };
     WsState wsState = WsState::DISCONNECTED;
@@ -148,10 +161,33 @@ class GlowlineUsermod : public Usermod {
       handshakeStatusLine = "";
       connectStartedAt = millis();
 
+      // TODO(security debt): setInsecure() accepts any certificate the server
+      // presents, with no chain-of-trust check -- encrypted, but still
+      // vulnerable to a MITM. Replace with setCACert() (or a pinned cert)
+      // before this ships for real.
+      client.setInsecure();
+      // Postpone the TLS handshake so the TCP connect and the handshake are
+      // two separate, individually-timed/logged steps below.
+      client.setPlainStart();
+
+      Serial.print(F("glowline ws: free heap before TLS handshake: "));
+      Serial.println(ESP.getFreeHeap());
+
       if (!client.connect(wsHost.c_str(), wsPort)) {
         onDisconnected(F("tcp connect failed"));
         return;
       }
+
+      Serial.print(F("glowline ws: tcp connected, starting TLS handshake, free heap: "));
+      Serial.println(ESP.getFreeHeap());
+
+      if (!client.startTLS()) {
+        onDisconnected(F("TLS handshake failed"));
+        return;
+      }
+
+      Serial.print(F("glowline ws: TLS handshake complete, free heap: "));
+      Serial.println(ESP.getFreeHeap());
 
       client.print(F("GET /ws?device="));
       client.print(urlEncode(wsDeviceId));
@@ -390,10 +426,10 @@ class GlowlineUsermod : public Usermod {
     }
 
     void appendConfigData() {
-      oappend(F("addInfo('glowline:host',1,'WebSocket server hostname or IP (ws://, no TLS)');"));
-      oappend(F("addInfo('glowline:port',1,'WebSocket server port');"));
+      oappend(F("addInfo('glowline:host',1,'WebSocket server hostname or IP (wss://, TLS but not certificate-verified)');"));
+      oappend(F("addInfo('glowline:port',1,'WebSocket server port (443 for a deployed Worker)');"));
       oappend(F("addInfo('glowline:deviceId',1,'Device ID sent as a query param on /ws');"));
-      oappend(F("addInfo('glowline:token',1,'Auth token sent as a query param on /ws (sent in plaintext over ws://)');"));
+      oappend(F("addInfo('glowline:token',1,'Auth token sent as a query param on /ws (encrypted in transit, but the server cert is not verified)');"));
     }
 
     void addToConfig(JsonObject& root) {
