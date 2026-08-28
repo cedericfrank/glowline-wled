@@ -234,6 +234,27 @@ class GlowlineUsermod : public Usermod {
       }
     }
 
+    // Hands the payload to the same deserializeState() path the JSON API
+    // (POST /json/state), WebSocket server, and UDP sync all use -- see
+    // ws.cpp's WS_EVT_DATA handler and udp.cpp's incoming-packet handler for
+    // the reference pattern this mirrors.
+    void applyJsonState(const uint8_t* payload, size_t len) {
+      if (!requestJSONBufferLock(JSON_LOCK_UNKNOWN)) {
+        Serial.println(F("glowline ws: JSON buffer busy, not applied"));
+        return;
+      }
+      DeserializationError error = deserializeJson(*pDoc, payload, len);
+      JsonObject root = pDoc->as<JsonObject>();
+      if (error || root.isNull()) {
+        Serial.println(F("glowline ws: not valid JSON, not applied"));
+        releaseJSONBufferLock();
+        return;
+      }
+      deserializeState(root);
+      releaseJSONBufferLock();
+      Serial.println(F("glowline ws: applied to WLED state"));
+    }
+
     void finishFrame() {
       size_t len = (size_t)((payloadIdx < MAX_FRAME_PAYLOAD) ? payloadIdx : MAX_FRAME_PAYLOAD);
       switch (frameOpcode) {
@@ -243,6 +264,7 @@ class GlowlineUsermod : public Usermod {
           Serial.write(frameBuf, len);
           if (payloadIdx > MAX_FRAME_PAYLOAD) Serial.print(F(" ...[truncated]"));
           Serial.println();
+          applyJsonState(frameBuf, len);
           break;
         case 0x8: // close
           Serial.println(F("glowline ws: received close frame"));
