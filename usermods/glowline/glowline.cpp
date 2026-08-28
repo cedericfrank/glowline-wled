@@ -1,6 +1,7 @@
 #include "wled.h"
 #include <WiFi.h>
 #include <base64.h>
+#include "esp_log.h"
 
 /*
  * Minimal diagnostic usermod. Does not affect LED output or WLED state.
@@ -346,7 +347,13 @@ class GlowlineUsermod : public Usermod {
     }
 
   public:
-    void setup() {}
+    void setup() {
+      // "rmt" tag spams a "flush timeout" error on every non-blocking poll of
+      // rmt_tx_wait_all_done() -- a cosmetic ESP-IDF logging bug
+      // (espressif/esp-idf#17527), not an actual failure. It floods the
+      // serial line badly enough to bury real output, so silence it.
+      esp_log_level_set("rmt", ESP_LOG_NONE);
+    }
 
     void loop() {
       if (millis() - lastTime_ >= INTERVAL_MS) {
