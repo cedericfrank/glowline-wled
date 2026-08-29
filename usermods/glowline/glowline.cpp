@@ -57,6 +57,7 @@ class GlowlineUsermod : public Usermod {
     static const unsigned long BACKOFF_MIN_MS = 1000;
     static const unsigned long BACKOFF_MAX_MS = 60000;
     unsigned long backoffMs = BACKOFF_MIN_MS;
+    unsigned long lastBackoffMs = BACKOFF_MIN_MS; // delay actually being waited for the upcoming retry, for accurate fire-time logging
     bool reconnectDue = false;
     unsigned long nextAttemptAt = 0;
 
@@ -119,6 +120,7 @@ class GlowlineUsermod : public Usermod {
     void onDisconnected(const __FlashStringHelper* reason) {
       client.stop();
       setState(WsState::DISCONNECTED);
+      lastBackoffMs = backoffMs;
       nextAttemptAt = millis() + backoffMs;
       reconnectDue = true;
       Serial.print(F("glowline ws: disconnected ("));
@@ -166,6 +168,12 @@ class GlowlineUsermod : public Usermod {
       // vulnerable to a MITM. Replace with setCACert() (or a pinned cert)
       // before this ships for real.
       client.setInsecure();
+      // Bound both blocking calls below explicitly: the library defaults (30s
+      // TCP connect, 120s TLS handshake) are far longer than our 60s backoff
+      // cap assumes, so a single hung attempt against a network that silently
+      // drops packets (rather than cleanly refusing) could otherwise block
+      // for up to ~150s before a retry is even scheduled.
+      client.setHandshakeTimeout(10); // seconds
       // Postpone the TLS handshake so the TCP connect and the handshake are
       // two separate, individually-timed/logged steps below.
       client.setPlainStart();
@@ -173,7 +181,7 @@ class GlowlineUsermod : public Usermod {
       Serial.print(F("glowline ws: free heap before TLS handshake: "));
       Serial.println(ESP.getFreeHeap());
 
-      if (!client.connect(wsHost.c_str(), wsPort)) {
+      if (!client.connect(wsHost.c_str(), wsPort, 10000)) { // 10s TCP connect timeout
         onDisconnected(F("tcp connect failed"));
         return;
       }
@@ -395,7 +403,19 @@ class GlowlineUsermod : public Usermod {
       if (millis() - lastTime_ >= INTERVAL_MS) {
         lastTime_ = millis();
         Serial.print(F("glowline usermod alive, free heap: "));
-        Serial.println(ESP.getFreeHeap());
+        Serial.print(ESP.getFreeHeap());
+        Serial.print(F(", ws: "));
+        Serial.print(stateName(wsState));
+        // Printed unconditionally every 5s (not just on state transitions) so
+        // a stalled retry loop is visible in serial even if no transition
+        // ever fires -- silence alone becomes evidence of a stall instead of
+        // being ambiguous with "nothing to report yet".
+        if (wsState == WsState::DISCONNECTED && reconnectDue) {
+          Serial.print(F(", next retry in "));
+          Serial.print((long)(nextAttemptAt - millis()));
+          Serial.print(F(" ms"));
+        }
+        Serial.println();
       }
 
       if (wsHost.length() == 0 || wsPort == 0) return; // not configured yet
@@ -408,6 +428,9 @@ class GlowlineUsermod : public Usermod {
       if (wsState == WsState::DISCONNECTED) {
         if (reconnectDue && (long)(millis() - nextAttemptAt) >= 0) {
           reconnectDue = false;
+          Serial.print(F("glowline ws: retry attempt firing (waited "));
+          Serial.print(lastBackoffMs);
+          Serial.println(F(" ms)"));
           beginConnect();
         }
         return;
