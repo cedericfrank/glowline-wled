@@ -20,6 +20,11 @@
  *   received, and reconnects with exponential backoff (1s doubling up to a
  *   60s cap) on disconnect. Every state transition is logged, and free heap
  *   is logged before, during and after the TLS handshake.
+ * - While connected, sends a ping every 30s and requires *something* back
+ *   (a pong, or any other inbound frame) within 90s -- a TCP socket can
+ *   report connected() == true while the actual path is dead, and this is
+ *   what actually catches that and forces a reconnect instead of sitting on
+ *   a socket that looks fine but never delivers anything again.
  *
  * TLS is via setInsecure() -- the connection is encrypted but the server's
  * certificate is NOT validated (no chain-of-trust check), so this is still
@@ -65,6 +70,15 @@ class GlowlineUsermod : public Usermod {
     static const unsigned long HANDSHAKE_TIMEOUT_MS = 5000;
     unsigned long connectStartedAt = 0;
     String handshakeStatusLine = "";
+
+    // Liveness: a TCP socket can stay "connected" while the actual path is
+    // dead (nothing arrives, nothing gets a response) -- ping periodically
+    // and require *something* back within the timeout, or treat it as dead
+    // and fall into the normal reconnect/backoff path.
+    static const unsigned long PING_INTERVAL_MS = 30000;
+    static const unsigned long LIVENESS_TIMEOUT_MS = 90000;
+    unsigned long lastPingSentAt = 0;
+    unsigned long lastInboundAt = 0;
 
     // Incoming frame parser (streaming, byte-at-a-time; small fixed payload
     // buffer -- fine for a diagnostic hello/heartbeat-style protocol)
@@ -233,6 +247,8 @@ class GlowlineUsermod : public Usermod {
           }
           setState(WsState::CONNECTED);
           backoffMs = BACKOFF_MIN_MS; // reset backoff after a successful connect
+          lastInboundAt = millis();
+          lastPingSentAt = millis();
           Serial.print(F("glowline ws: connected, free heap: "));
           Serial.println(ESP.getFreeHeap());
           sendFrame(0x1, (const uint8_t*)"hello from glowline", 20);
@@ -301,6 +317,7 @@ class GlowlineUsermod : public Usermod {
     }
 
     void finishFrame() {
+      lastInboundAt = millis(); // any complete frame counts as proof the connection is alive
       size_t len = (size_t)((payloadIdx < MAX_FRAME_PAYLOAD) ? payloadIdx : MAX_FRAME_PAYLOAD);
       switch (frameOpcode) {
         case 0x1: // text
@@ -390,6 +407,26 @@ class GlowlineUsermod : public Usermod {
       }
     }
 
+    // Sends a periodic ping and requires *something* back (a pong, or any
+    // other inbound frame) within LIVENESS_TIMEOUT_MS. A TCP socket can
+    // report connected() == true while the actual path is dead -- this is
+    // what actually detects that and forces a reconnect.
+    void checkLiveness() {
+      unsigned long now = millis();
+      if (now - lastInboundAt >= LIVENESS_TIMEOUT_MS) {
+        Serial.print(F("glowline ws: no inbound frame in "));
+        Serial.print(LIVENESS_TIMEOUT_MS / 1000);
+        Serial.println(F("s, treating connection as dead"));
+        onDisconnected(F("liveness timeout"));
+        return;
+      }
+      if (now - lastPingSentAt >= PING_INTERVAL_MS) {
+        lastPingSentAt = now;
+        Serial.println(F("glowline ws: sending ping"));
+        sendFrame(0x9, nullptr, 0);
+      }
+    }
+
   public:
     void setup() {
       // "rmt" tag spams a "flush timeout" error on every non-blocking poll of
@@ -414,6 +451,10 @@ class GlowlineUsermod : public Usermod {
           Serial.print(F(", next retry in "));
           Serial.print((long)(nextAttemptAt - millis()));
           Serial.print(F(" ms"));
+        } else if (wsState == WsState::CONNECTED) {
+          Serial.print(F(", last inbound "));
+          Serial.print((millis() - lastInboundAt) / 1000);
+          Serial.print(F("s ago"));
         }
         Serial.println();
       }
@@ -445,6 +486,7 @@ class GlowlineUsermod : public Usermod {
         pollHandshake();
       } else if (wsState == WsState::CONNECTED) {
         pollFrames();
+        if (wsState == WsState::CONNECTED) checkLiveness(); // pollFrames() may have disconnected us (e.g. a close frame)
       }
     }
 
