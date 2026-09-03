@@ -20,3 +20,9 @@ extends = env:esp32s3dev_16MB_opi
 platform = ${esp32_idf_V5.platform_pioarduino}
 platform_packages = ${esp32_idf_V5.platform_packages_pioarduino}
 custom_usermods = ${env:esp32s3dev_16MB_opi.custom_usermods} glowline
+# Setup access point is named Glowline-XXXX (last 4 hex chars of the MAC),
+# open/no password, instead of the default "WLED-AP" + "wled1234". The
+# WLED_AP_SSID define below is never actually used at runtime (GLOWLINE_AP_SSID
+# overrides apSSID directly) -- it's only there to satisfy wled.h's guard
+# against pairing a custom password with the still-default SSID.
+build_flags = ${env:esp32s3dev_16MB_opi.build_flags} -D GLOWLINE_AP_SSID -D WLED_AP_SSID=\"Glowline-AP\" -D WLED_AP_PASS=\"\"

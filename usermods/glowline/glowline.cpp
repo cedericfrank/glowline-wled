@@ -10,7 +10,8 @@
 #endif
 
 /*
- * Minimal diagnostic usermod. Does not affect LED output or WLED state.
+ * Diagnostic + control usermod: bridges WLED to a Glowline backend over
+ * WebSocket, applying whatever state it's sent.
  *
  * - Prints a heartbeat and the current free heap to Serial every 5 seconds.
  * - Maintains a TLS (wss://) WebSocket connection to
@@ -20,11 +21,18 @@
  *   received, and reconnects with exponential backoff (1s doubling up to a
  *   60s cap) on disconnect. Every state transition is logged, and free heap
  *   is logged before, during and after the TLS handshake.
+ * - Received JSON is applied directly to WLED's own state (same path as the
+ *   JSON API), so a message can turn the strip on, change color, effects,
+ *   brightness, etc.
  * - While connected, sends a ping every 30s and requires *something* back
  *   (a pong, or any other inbound frame) within 90s -- a TCP socket can
  *   report connected() == true while the actual path is dead, and this is
  *   what actually catches that and forces a reconnect instead of sitting on
  *   a socket that looks fine but never delivers anything again.
+ * - The first time a config change (a Settings -> Usermods save, not just a
+ *   plain reboot) leads to a successful connection, plays an unmistakable
+ *   "setup worked" cue: brief full-brightness green, then solid white at
+ *   50%. Lets someone confirm setup succeeded without checking their phone.
  *
  * TLS is via setInsecure() -- the connection is encrypted but the server's
  * certificate is NOT validated (no chain-of-trust check), so this is still
@@ -79,6 +87,21 @@ class GlowlineUsermod : public Usermod {
     static const unsigned long LIVENESS_TIMEOUT_MS = 90000;
     unsigned long lastPingSentAt = 0;
     unsigned long lastInboundAt = 0;
+
+    // First-connection success signal: an unmistakable "setup worked" cue --
+    // brief green, then settle to solid white at 50% -- played once on the
+    // first successful connect after a config change (not on every
+    // reconnect), so someone doesn't have to check their phone to know it's
+    // set up right.
+    static const unsigned long SUCCESS_SIGNAL_GREEN_MS = 1500;
+    bool successSignalPending = false; // armed by a config save, cleared once played
+    bool successSignalPlaying = false; // currently in the green phase
+    unsigned long successSignalStartedAt = 0;
+    // readFromConfig() runs once at boot (loading whatever's already on
+    // disk) and again on every live Settings->Usermods save -- only the
+    // latter is an actual "config change", so the signal is armed starting
+    // from the second call onward, not the first.
+    bool hasLoadedConfigOnce = false;
 
     // Incoming frame parser (streaming, byte-at-a-time; small fixed payload
     // buffer -- fine for a diagnostic hello/heartbeat-style protocol)
@@ -252,6 +275,10 @@ class GlowlineUsermod : public Usermod {
           Serial.print(F("glowline ws: connected, free heap: "));
           Serial.println(ESP.getFreeHeap());
           sendFrame(0x1, (const uint8_t*)"hello from glowline", 20);
+          if (successSignalPending) {
+            successSignalPending = false;
+            startSuccessSignal();
+          }
           return;
         }
         if (handshakeStatusLine.length() == 0) handshakeStatusLine = line;
@@ -314,6 +341,24 @@ class GlowlineUsermod : public Usermod {
       deserializeState(root);
       releaseJSONBufferLock();
       Serial.println(F("glowline ws: applied to WLED state"));
+    }
+
+    // Unmistakable "setup worked" cue: brief full-brightness green, then
+    // settle to solid white at 50%. Goes through the same applyJsonState()
+    // path as everything else that changes WLED state.
+    void startSuccessSignal() {
+      successSignalPlaying = true;
+      successSignalStartedAt = millis();
+      Serial.println(F("glowline: first connect after config change -- playing success signal (green)"));
+      static const char kGreen[] = "{\"on\":true,\"bri\":255,\"seg\":[{\"fx\":0,\"col\":[[0,255,0]]}]}";
+      applyJsonState((const uint8_t*)kGreen, strlen(kGreen));
+    }
+
+    void finishSuccessSignal() {
+      successSignalPlaying = false;
+      Serial.println(F("glowline: success signal settling to solid white 50%"));
+      static const char kWhite[] = "{\"on\":true,\"bri\":128,\"seg\":[{\"fx\":0,\"col\":[[255,255,255]]}]}";
+      applyJsonState((const uint8_t*)kWhite, strlen(kWhite));
     }
 
     void finishFrame() {
@@ -459,6 +504,10 @@ class GlowlineUsermod : public Usermod {
         Serial.println();
       }
 
+      if (successSignalPlaying && millis() - successSignalStartedAt >= SUCCESS_SIGNAL_GREEN_MS) {
+        finishSuccessSignal();
+      }
+
       if (wsHost.length() == 0 || wsPort == 0) return; // not configured yet
 
       if (!WLED_CONNECTED) {
@@ -517,6 +566,12 @@ class GlowlineUsermod : public Usermod {
       // immediately, whether this is the initial boot load or a change
       // saved from Settings -> Usermods.
       resetAndScheduleImmediateConnect();
+
+      // Only a live save (the second-and-later call) counts as "a config
+      // change" for the success signal -- not the initial boot-time load of
+      // whatever was already saved.
+      if (hasLoadedConfigOnce) successSignalPending = true;
+      hasLoadedConfigOnce = true;
 
       return configComplete;
     }
