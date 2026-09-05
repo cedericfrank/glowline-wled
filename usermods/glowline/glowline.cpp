@@ -55,6 +55,26 @@ class GlowlineUsermod : public Usermod {
     unsigned long lastTime_ = 0;
     static const unsigned long INTERVAL_MS = 5000;
 
+    // Boot cue: replaces WLED's default "on, orange" power-up state with a
+    // branded status sequence, drawn directly via handleOverlayDraw() (raw
+    // pixel writes every frame, right before strip.show()) rather than
+    // through WLED's effect engine, since effects have no precise
+    // speed-to-duration mapping and this needs exact timing.
+    //   1. Fill (white) from the first to the last LED over 1s.
+    //   2. Hold fully lit (white) while waiting for a WiFi connection.
+    //   3. WiFi connects  -> solid green for 1s, then off.
+    //      WiFi times out -> solid red for 5s, then off.
+    // Runs once per physical boot (driven by setup(), not by config saves),
+    // at a fixed 50% brightness throughout.
+    enum class BootCuePhase : uint8_t { CUE_FILL, CUE_WAIT_WIFI, CUE_GREEN, CUE_RED, CUE_DONE };
+    static const uint8_t BOOT_CUE_BRI = 128; // 50%
+    static const unsigned long BOOT_CUE_FILL_MS = 1000;
+    static const unsigned long BOOT_CUE_WIFI_WAIT_MS = 10000; // budget after the fill before declaring failure
+    static const unsigned long BOOT_CUE_GREEN_MS = 1000;
+    static const unsigned long BOOT_CUE_RED_MS = 5000;
+    BootCuePhase bootCuePhase = BootCuePhase::CUE_FILL;
+    unsigned long bootCuePhaseStartedAt = 0;
+
     // WebSocket config (Settings -> Usermods)
     String wsHost = "";
     uint16_t wsPort = 0;
@@ -472,6 +492,52 @@ class GlowlineUsermod : public Usermod {
       }
     }
 
+    // Ends the boot cue and hands the strip back to normal operation, off.
+    // Without this, handleOverlayDraw() simply stops drawing and whatever
+    // WLED's own default state was (orange, per beginStrip()) would show
+    // through underneath -- exactly what this whole cue exists to avoid.
+    void finishBootCue() {
+      bootCuePhase = BootCuePhase::CUE_DONE;
+      Serial.println(F("glowline: boot cue finished"));
+      static const char kOff[] = "{\"on\":false}";
+      applyJsonState((const uint8_t*)kOff, strlen(kOff));
+    }
+
+    // Advances the boot cue's phase based on elapsed time and WiFi state.
+    // Call once per loop() tick; the actual pixel painting happens in
+    // handleOverlayDraw() so it stays exactly in sync with what's shown.
+    void advanceBootCue() {
+      if (bootCuePhase == BootCuePhase::CUE_DONE) return;
+      unsigned long elapsed = millis() - bootCuePhaseStartedAt;
+      switch (bootCuePhase) {
+        case BootCuePhase::CUE_FILL:
+          if (elapsed >= BOOT_CUE_FILL_MS) {
+            bootCuePhase = BootCuePhase::CUE_WAIT_WIFI;
+            bootCuePhaseStartedAt = millis();
+          }
+          break;
+        case BootCuePhase::CUE_WAIT_WIFI:
+          if (WLED_CONNECTED) {
+            Serial.println(F("glowline: boot cue -- WiFi connected"));
+            bootCuePhase = BootCuePhase::CUE_GREEN;
+            bootCuePhaseStartedAt = millis();
+          } else if (elapsed >= BOOT_CUE_WIFI_WAIT_MS) {
+            Serial.println(F("glowline: boot cue -- WiFi did not connect in time"));
+            bootCuePhase = BootCuePhase::CUE_RED;
+            bootCuePhaseStartedAt = millis();
+          }
+          break;
+        case BootCuePhase::CUE_GREEN:
+          if (elapsed >= BOOT_CUE_GREEN_MS) finishBootCue();
+          break;
+        case BootCuePhase::CUE_RED:
+          if (elapsed >= BOOT_CUE_RED_MS) finishBootCue();
+          break;
+        case BootCuePhase::CUE_DONE:
+          break;
+      }
+    }
+
   public:
     void setup() {
       // "rmt" tag spams a "flush timeout" error on every non-blocking poll of
@@ -479,9 +545,55 @@ class GlowlineUsermod : public Usermod {
       // (espressif/esp-idf#17527), not an actual failure. It floods the
       // serial line badly enough to bury real output, so silence it.
       esp_log_level_set("rmt", ESP_LOG_NONE);
+
+      // Start the boot cue immediately, before WLED's own first render:
+      // beginStrip() (which runs just before usermod setup()) sets bri/color
+      // to its own on+orange default, but doesn't call strip.show() with
+      // those values -- the first actual render happens once loop() starts,
+      // by which point this has already taken over. bri is forced to a
+      // fixed 50% for the whole cue; offMode is forced false so the render
+      // loop actually runs even if "turn on at boot" is configured off.
+      bri = BOOT_CUE_BRI;
+      offMode = false;
+      bootCuePhaseStartedAt = millis();
+    }
+
+    // Called every frame, after effects are processed but before strip.show()
+    // -- lets the boot cue paint raw pixels with exact timing, independent of
+    // WLED's effect engine and whatever segment/effect state underlies it.
+    void handleOverlayDraw() {
+      if (bootCuePhase == BootCuePhase::CUE_DONE) return;
+      uint16_t total = strip.getLengthTotal();
+      uint32_t color;
+      uint16_t lit = total;
+      switch (bootCuePhase) {
+        case BootCuePhase::CUE_FILL: {
+          unsigned long elapsed = millis() - bootCuePhaseStartedAt;
+          uint32_t filled = ((uint32_t)total * (elapsed < BOOT_CUE_FILL_MS ? elapsed : BOOT_CUE_FILL_MS)) / BOOT_CUE_FILL_MS;
+          lit = (uint16_t)filled;
+          color = RGBW32(255, 255, 255, 0);
+          break;
+        }
+        case BootCuePhase::CUE_WAIT_WIFI:
+          color = RGBW32(255, 255, 255, 0);
+          break;
+        case BootCuePhase::CUE_GREEN:
+          color = RGBW32(0, 255, 0, 0);
+          break;
+        case BootCuePhase::CUE_RED:
+          color = RGBW32(255, 0, 0, 0);
+          break;
+        default:
+          return;
+      }
+      for (uint16_t i = 0; i < total; i++) {
+        strip.setPixelColor(i, i < lit ? color : (uint32_t)0);
+      }
     }
 
     void loop() {
+      advanceBootCue();
+
       if (millis() - lastTime_ >= INTERVAL_MS) {
         lastTime_ = millis();
         Serial.print(F("glowline usermod alive, free heap: "));
