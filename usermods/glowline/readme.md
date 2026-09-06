@@ -44,10 +44,13 @@ who unboxes a unit with nobody technical present.
 
 ## Build & flash
 
-Copy `platformio_override.ini.sample` to the repository root as
-`platformio_override.ini` (the same directory as `platformio.ini`). That
-file is gitignored, so this is a one-time local step needed to include the
-usermod in a build — without it, `glowline` is not compiled in.
+`platformio_override.ini` at the repository root (the same directory as
+`platformio.ini`) is already tracked in this repo — `git pull` gets you a
+working config, no setup step needed. (It's not actually gitignored, despite
+upstream WLED convention normally treating this file as personal/local-only —
+worth keeping in mind before committing your own tweaks to it.) If you ever
+need to recreate it from scratch, `usermods/glowline/platformio_override.ini.sample`
+is the template:
 
 ```
 cp usermods/glowline/platformio_override.ini.sample platformio_override.ini
@@ -64,7 +67,12 @@ Two environments are defined:
   compiled out. Kept only for quick non-TLS testing of the rest of the
   usermod.
 
-Build and flash the S3 env:
+Build and flash the S3 env — **always pin `-e` explicitly**, don't rely on
+`default_envs` alone. It currently points at the S3 env too, but a bare
+`pio run -t upload` (or VS Code's default Upload task, which also omits `-e`)
+depending on that silently built and flashed the non-functional non-TLS env
+before this was caught, and nothing stops it from pointing at the wrong env
+again in the future:
 
 ```
 pio run -e esp32s3_glowline_pioarduino -t upload
