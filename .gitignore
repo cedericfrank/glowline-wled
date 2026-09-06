@@ -23,6 +23,9 @@ wled-update.sh
 /node_modules/
 /logs/
 
+# Shared spec with glowline-app; kept out of this public repo's history.
+/docs/OTA.md
+
 /wled00/extLibs
 /wled00/LittleFS
 /wled00/my_config.h
