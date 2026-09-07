@@ -1,12 +1,36 @@
 #include "wled.h"
 #include <WiFi.h>
 #include <base64.h>
+#include <Update.h>
+#include <Preferences.h>
 #include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "mbedtls/pk.h"
+#include "mbedtls/md.h"
+#include "mbedtls/sha256.h"
+#include "mbedtls/base64.h"
 
 #if __has_include(<WiFiClientSecure.h>)
   #include <WiFiClientSecure.h>
 #else
   #error "glowline needs a WiFiClientSecure/NetworkClientSecure-capable platform for wss:// -- e.g. pioarduino/platform-espressif32 (see usermods/glowline/platformio_override.ini.sample). The default tasmota-sourced espressif32 platform ships TLS compiled out."
+#endif
+
+// This build's self-reported firmware version -- sent as &fw= on the /ws handshake (docs/OTA.md
+// Section 3) and used as the /ota/check query and the locally-persisted "known bad" marker.
+// Set per release via build_flags, e.g. -D GLOWLINE_FW_VERSION=\"1.2.0\" -- never hand-edit this
+// default and ship it, or every unit reports the same version forever.
+#ifndef GLOWLINE_FW_VERSION
+#define GLOWLINE_FW_VERSION "0.0.0-dev"
+#endif
+
+// How long a freshly-flashed image has to prove (via a successful WebSocket CONNECT -- see
+// pollHandshake()) that it can actually reach the backend before the bootloader rolls it back.
+// 15 minutes in any build that ships -- overridden to 2 minutes ONLY by the
+// *_BENCH_2MIN_ROLLBACK_DO_NOT_SHIP env in platformio_override.ini, which also makes setup() print
+// an unmissable warning on every boot when this isn't the real value.
+#ifndef OTA_VERIFY_TIMEOUT_MS
+#define OTA_VERIFY_TIMEOUT_MS (15UL * 60UL * 1000UL)
 #endif
 
 /*
@@ -139,6 +163,57 @@ class GlowlineUsermod : public Usermod {
     uint8_t frameBuf[MAX_FRAME_PAYLOAD];
     uint64_t payloadIdx = 0;
 
+    // OTA update (docs/OTA.md Section 5). The check-and-download sequence is intentionally
+    // blocking rather than threaded through the wsState machine above: it runs once per WS
+    // CONNECTED transition, a plain 204 resolves in well under a second, and even a real download
+    // (a couple of MB over TLS) is a rare, deliberate event, not something the rest of the usermod
+    // needs to stay responsive through. WLED_WATCHDOG_TIMEOUT=0 for this board env
+    // (platformio.ini's esp32s3dev_16MB_opi) means this can't trip WLED's own watchdog.
+    static const unsigned long OTA_CHECK_COOLDOWN_MS = 60000; // shared by "just checked" and the 429 case below
+    unsigned long otaCheckBlockedUntil = 0;
+
+    // Set in setup() if esp_ota_get_state_partition() reports the running image as
+    // PENDING_VERIFY -- only true right after a fresh OTA flash, never after a USB/factory flash
+    // or an already-confirmed reboot. Cleared the moment a WS CONNECTED proves this image can
+    // reach the backend (pollHandshake()); if that never happens within OTA_VERIFY_TIMEOUT_MS,
+    // loop() rolls the device back to its previous image.
+    bool otaPendingVerify = false;
+    unsigned long otaBootTime = 0;
+
+    // NVS ("ota" namespace), read once at boot, surviving the reboot a rollback itself causes:
+    //   failedVer -- a version known to roll back on this device. Refused locally, before any
+    //                network/crypto work, independent of whether the server still offers it as a
+    //                target. Cleared ONLY when a *different* version's mark-valid succeeds (see
+    //                pollHandshake()) -- deliberately outlives the one-shot rolled_back report
+    //                below, so clearing it can't race the server's own processing of that report
+    //                on the very next /ota/check in the same connect cycle.
+    //   rbPending  -- true if the rolled_back frame for failedVer hasn't been sent yet. Read once
+    //                 at boot; cleared the moment that frame actually sends.
+    String otaKnownBadVersion = "";
+    bool otaRollbackReportPending = false;
+
+    // A check/download attempt failed without ever rebooting (bad signature, hash mismatch, HTTP
+    // error, dropped connection) -- the wss link may have been closed for the download, so this is
+    // held in RAM and reported once the normal reconnect brings CONNECTED back, not sent inline.
+    bool otaFailurePending = false;
+    String otaFailureReason = "";
+
+    static const uint8_t OTA_CUE_BRI = 96; // dim, but unmistakably not "off" or "frozen"
+
+    // Both PEMs exactly as OpenSSL emits them (openssl ec -pubout). The manifest's keyId selects
+    // which one verifies its signature -- "primary" or "spare". The spare exists so a leaked
+    // primary key doesn't require physically reflashing every unit already in the field.
+    static constexpr const char* kOtaKeyPrimary =
+      "-----BEGIN PUBLIC KEY-----\n"
+      "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEBuUddsyboiSmr7v/QyjBwGKBRrc4\n"
+      "7Ih/H9JG+Rxcc0onmxJgH4+K7haVW+8TO9xthwDcjpcsGSn5R3YnVBA6/w==\n"
+      "-----END PUBLIC KEY-----\n";
+    static constexpr const char* kOtaKeySpare =
+      "-----BEGIN PUBLIC KEY-----\n"
+      "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEaTv+HkVrT04aSjnNHdNVusWt49JW\n"
+      "E1U86cd5LS7pN3jyfLiCO6IiGBjBW3UbDe8Nc6Veay0J3aMwOPzGsdBLCQ==\n"
+      "-----END PUBLIC KEY-----\n";
+
     static const char* stateName(WsState s) {
       switch (s) {
         case WsState::DISCONNECTED: return "DISCONNECTED";
@@ -258,6 +333,8 @@ class GlowlineUsermod : public Usermod {
       client.print(urlEncode(wsDeviceId));
       client.print(F("&token="));
       client.print(urlEncode(wsToken));
+      client.print(F("&fw="));
+      client.print(urlEncode(String(F(GLOWLINE_FW_VERSION))));
       client.print(F(" HTTP/1.1\r\n"));
       client.print(F("Host: "));
       client.print(wsHost);
@@ -299,6 +376,31 @@ class GlowlineUsermod : public Usermod {
             successSignalPending = false;
             startSuccessSignal();
           }
+
+          // Mark-valid happens ONLY here, on a proven CONNECTED -- never in setup(), never on
+          // WiFi association alone. A bad wss host/port baked into a new image would still pass a
+          // WiFi-only check and roll back nothing; reaching this exact point is what actually
+          // proves the new firmware can talk to the backend.
+          if (otaPendingVerify) {
+            esp_ota_mark_app_valid_cancel_rollback();
+            otaPendingVerify = false;
+            Serial.println(F("glowline ota: image marked valid (WS connected)"));
+            // This confirms a different, working image -- whatever local block existed for a
+            // previously-failed version no longer applies. See otaKnownBadVersion's own comment
+            // for why this is the only place that clears it.
+            if (otaKnownBadVersion.length() > 0) {
+              otaKnownBadVersion = "";
+              Preferences prefs;
+              prefs.begin("ota", false);
+              prefs.remove("failedVer");
+              prefs.end();
+            }
+          }
+
+          if (otaRollbackReportPending) sendOtaRolledBackFrame();
+          if (otaFailurePending) sendOtaFailedFrame();
+
+          checkForOtaUpdate(); // blocking; respects its own cooldown internally
           return;
         }
         if (handshakeStatusLine.length() == 0) handshakeStatusLine = line;
@@ -538,13 +640,520 @@ class GlowlineUsermod : public Usermod {
       }
     }
 
+    // ---- OTA update helpers (docs/OTA.md Section 5) ----
+
+    static const char* selectOtaKey(const String& keyId) {
+      if (keyId == "primary") return kOtaKeyPrimary;
+      if (keyId == "spare") return kOtaKeySpare;
+      return nullptr;
+    }
+
+    // ota_failed's error field is hand-embedded into a JSON string, not run through a serializer --
+    // strip anything that would break that (quotes, control chars) rather than properly escaping
+    // it, since this is a short diagnostic string, not structured data. Matters because the HTTP
+    // 400+ path embeds a real response body here, which is externally-influenced content.
+    static String sanitizeForJsonString(const String& in, size_t maxLen = 120) {
+      String out;
+      for (size_t i = 0; i < in.length() && out.length() < maxLen; i++) {
+        char c = in[i];
+        if (c == '"' || c == '\\' || (uint8_t)c < 0x20) continue;
+        out += c;
+      }
+      return out;
+    }
+
+    // https://<host>[:port]/<path-and-query> -> host/port/path. Only https:// is ever expected;
+    // the manifest's url is otherwise opaque -- whatever's after the host is forwarded as-is.
+    static bool parseHttpsUrl(const String& url, String& host, uint16_t& port, String& path) {
+      if (!url.startsWith("https://")) return false;
+      int hostStart = 8; // strlen("https://")
+      int pathStart = url.indexOf('/', hostStart);
+      String hostPort = (pathStart < 0) ? url.substring(hostStart) : url.substring(hostStart, pathStart);
+      path = (pathStart < 0) ? "/" : url.substring(pathStart);
+
+      int colonIdx = hostPort.indexOf(':');
+      if (colonIdx < 0) {
+        host = hostPort;
+        port = 443;
+      } else {
+        host = hostPort.substring(0, colonIdx);
+        port = (uint16_t)hostPort.substring(colonIdx + 1).toInt();
+      }
+      return host.length() > 0;
+    }
+
+    // Exponential backoff on SSL/connection failures specifically (500ms, 1s, 2s -- max 3 tries),
+    // never on HTTP-level errors (those fail immediately below, no retry). Credited: this exact
+    // schedule, and the reasoning (ESP32 TLS hardware-accelerator flakiness under load), come from
+    // the reference OTA implementation docs/OTA.md Section 2 compares against. Reuses the same
+    // `client` member as the wss link -- by the time this is ever called, that link has already
+    // been closed (see performOtaDownload()), so only one TLS session is ever live at a time.
+    bool connectHttpsWithRetry(const String& host, uint16_t port) {
+      static const unsigned long kDelaysMs[] = {500, 1000, 2000};
+      for (int attempt = 0; attempt < 3; attempt++) {
+        client.setInsecure(); // same known debt as the wss connection -- see file header comment
+        client.setHandshakeTimeout(10);
+        client.setPlainStart();
+        if (client.connect(host.c_str(), port, 10000) && client.startTLS()) {
+          return true;
+        }
+        Serial.print(F("glowline ota: connect/TLS attempt "));
+        Serial.print(attempt + 1);
+        Serial.println(F(" failed"));
+        client.stop();
+        if (attempt < 2) delay(kDelaysMs[attempt]);
+      }
+      return false;
+    }
+
+    // For a response body that comfortably fits in RAM -- the manifest JSON, or an HTTP error
+    // body. Never used for the firmware binary itself (see performOtaDownload(), which streams
+    // straight into Update.write() without ever buffering the whole thing). Uses
+    // "Connection: close" so end-of-body is just end-of-stream, no chunked-transfer handling
+    // needed for these small, server-controlled responses.
+    bool httpGetSmall(const String& host, uint16_t port, const String& path, int& status, String& body, int& retryAfterSec) {
+      status = 0;
+      body = "";
+      retryAfterSec = -1;
+      if (!connectHttpsWithRetry(host, port)) return false;
+
+      client.print(F("GET "));
+      client.print(path);
+      client.print(F(" HTTP/1.1\r\nHost: "));
+      client.print(host);
+      client.print(F("\r\nConnection: close\r\n\r\n"));
+
+      String statusLine = "";
+      bool headersDone = false;
+      unsigned long startedAt = millis();
+      while (millis() - startedAt < 10000) {
+        while (client.available()) {
+          String line = client.readStringUntil('\n');
+          while (line.length() && (line[line.length() - 1] == '\r' || line[line.length() - 1] == '\n')) line.remove(line.length() - 1);
+          if (!headersDone) {
+            if (statusLine.length() == 0) {
+              statusLine = line;
+              int sp1 = line.indexOf(' ');
+              int sp2 = line.indexOf(' ', sp1 + 1);
+              if (sp1 > 0 && sp2 > sp1) status = line.substring(sp1 + 1, sp2).toInt();
+            } else if (line.length() == 0) {
+              headersDone = true;
+            } else if (line.startsWith("Retry-After:") || line.startsWith("retry-after:")) {
+              retryAfterSec = line.substring(line.indexOf(':') + 1).toInt();
+            }
+          } else {
+            body += line;
+            body += '\n';
+          }
+        }
+        if (!client.connected() && !client.available()) break;
+      }
+      client.stop();
+      return statusLine.length() > 0;
+    }
+
+    // Rebuilds the exact signed byte string (docs/OTA.md Section 3's addendum) and verifies it
+    // against whichever embedded key `keyId` selects. `url` is deliberately excluded from this --
+    // it's untrusted transport, policed instead by the SHA-256 comparison after download.
+    bool verifyManifestSignature(const String& version, uint32_t size, const String& sha256, const String& keyId, const String& signatureB64) {
+      const char* pem = selectOtaKey(keyId);
+      if (!pem) {
+        Serial.print(F("glowline ota: unknown keyId: "));
+        Serial.println(keyId);
+        return false;
+      }
+
+      String signedBytes = version + "\n" + String(size) + "\n" + sha256 + "\n" + keyId;
+
+      uint8_t hash[32];
+      mbedtls_sha256_context shaCtx;
+      mbedtls_sha256_init(&shaCtx);
+      mbedtls_sha256_starts(&shaCtx, 0 /* SHA-256, not SHA-224 */);
+      mbedtls_sha256_update(&shaCtx, (const unsigned char*)signedBytes.c_str(), signedBytes.length());
+      mbedtls_sha256_finish(&shaCtx, hash);
+      mbedtls_sha256_free(&shaCtx);
+
+      uint8_t sigBuf[128];
+      size_t sigLen = 0;
+      if (mbedtls_base64_decode(sigBuf, sizeof(sigBuf), &sigLen, (const unsigned char*)signatureB64.c_str(), signatureB64.length()) != 0) {
+        Serial.println(F("glowline ota: signature is not valid base64"));
+        return false;
+      }
+
+      mbedtls_pk_context pk;
+      mbedtls_pk_init(&pk);
+      int ret = mbedtls_pk_parse_public_key(&pk, (const unsigned char*)pem, strlen(pem) + 1);
+      if (ret != 0) {
+        Serial.print(F("glowline ota: failed to parse embedded public key, keyId="));
+        Serial.println(keyId);
+        mbedtls_pk_free(&pk);
+        return false;
+      }
+
+      ret = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, sizeof(hash), sigBuf, sigLen);
+      mbedtls_pk_free(&pk);
+
+      if (ret != 0) {
+        Serial.print(F("glowline ota: signature verification FAILED, mbedtls error -0x"));
+        Serial.println(-ret, HEX);
+        return false;
+      }
+      Serial.print(F("glowline ota: signature verified OK, keyId="));
+      Serial.println(keyId);
+      return true;
+    }
+
+    // Set once, right before the blocking check/download sequence starts. loop() is about to stop
+    // iterating normally -- from under a second (a plain 204) to tens of seconds (an actual
+    // download) -- so nothing will call strip.show() again on its own until this returns. This is
+    // the only way anything reaches the physical LEDs during that window: a direct, out-of-band
+    // render, bypassing the normal per-frame pipeline entirely. Dim solid blue, chosen to be
+    // distinct from every other cue this usermod uses (the boot cue's white/green/red, the
+    // config-save success signal's green/white) -- so it reads as "doing something on purpose,"
+    // not as a crash or a frozen boot cue.
+    void showOtaUpdatingCue() {
+      bri = OTA_CUE_BRI;
+      offMode = false;
+      uint16_t total = strip.getLengthTotal();
+      for (uint16_t i = 0; i < total; i++) strip.setPixelColor(i, RGBW32(0, 0, 255, 0));
+      strip.show();
+    }
+
+    // Clears the updating cue after a failed attempt -- a successful one reboots instead, making
+    // this moot. Goes through applyJsonState like every other post-boot-cue state change (normal
+    // per-frame rendering has resumed by the time this runs), not another direct strip.show().
+    void clearOtaUpdatingCue() {
+      static const char kOff[] = "{\"on\":false}";
+      applyJsonState((const uint8_t*)kOff, strlen(kOff));
+    }
+
+    // Records a failure to report once reconnected (the wss link may already be closed at this
+    // point -- see performOtaDownload()), clears the updating cue, and re-arms the normal
+    // reconnect path. Never sends anything itself; pollHandshake() sends the deferred report the
+    // next time CONNECTED fires.
+    void recordOtaFailure(const String& reason) {
+      Serial.print(F("glowline ota: FAILED: "));
+      Serial.println(reason);
+      otaFailurePending = true;
+      otaFailureReason = sanitizeForJsonString(reason);
+      clearOtaUpdatingCue();
+      resetAndScheduleImmediateConnect();
+    }
+
+    void sendOtaFailedFrame() {
+      String msg = String("{\"type\":\"ota_result\",\"status\":\"failed\",\"error\":\"") + otaFailureReason + "\"}";
+      sendFrame(0x1, (const uint8_t*)msg.c_str(), msg.length());
+      Serial.print(F("glowline ota: sent failed report: "));
+      Serial.println(otaFailureReason);
+      otaFailurePending = false;
+      otaFailureReason = "";
+    }
+
+    void sendOtaRolledBackFrame() {
+      String msg = String("{\"type\":\"ota_result\",\"status\":\"rolled_back\",\"version\":\"") + otaKnownBadVersion + "\"}";
+      sendFrame(0x1, (const uint8_t*)msg.c_str(), msg.length());
+      Serial.print(F("glowline ota: sent rolled_back report for version "));
+      Serial.println(otaKnownBadVersion);
+      otaRollbackReportPending = false;
+      Preferences prefs;
+      prefs.begin("ota", false);
+      prefs.putBool("rbPending", false);
+      prefs.end();
+    }
+
+    // Downloads and flashes a verified update. By the time this is called, the signature has
+    // already passed (checkForOtaUpdate()) -- this function's only remaining job is to fetch the
+    // bytes, prove via SHA-256 that they're the bytes the manifest actually described, and commit
+    // or abandon accordingly. Blocking throughout; see the class-level OTA comment for why.
+    void performOtaDownload(const String& version, uint32_t size, const String& url, const String& sha256Hex) {
+      String host, path;
+      uint16_t port;
+      if (!parseHttpsUrl(url, host, port, path)) {
+        recordOtaFailure(F("manifest url not https"));
+        return;
+      }
+
+      Serial.print(F("glowline ota: verified update available, version "));
+      Serial.print(version);
+      Serial.print(F(", size "));
+      Serial.println(size);
+
+      showOtaUpdatingCue();
+
+      // Close the wss link before downloading: running its TLS session concurrently with the
+      // download's own would mean two mbedtls sessions' record buffers live in internal SRAM at
+      // once (~40KB each, based on this usermod's own measured wss-handshake heap cost). The
+      // existing backoff/reconnect state machine already handles bringing it back afterward.
+      client.stop();
+      setState(WsState::DISCONNECTED);
+      Serial.print(F("glowline ota: free heap after closing wss link: "));
+      Serial.println(ESP.getFreeHeap());
+
+      if (!connectHttpsWithRetry(host, port)) {
+        recordOtaFailure(F("download: connect/TLS failed"));
+        return;
+      }
+      Serial.print(F("glowline ota: free heap after download TLS connect: "));
+      Serial.println(ESP.getFreeHeap());
+
+      client.print(F("GET "));
+      client.print(path);
+      client.print(F(" HTTP/1.1\r\nHost: "));
+      client.print(host);
+      client.print(F("\r\nConnection: close\r\n\r\n"));
+
+      String statusLine = "";
+      bool headersDone = false;
+      int status = 0;
+      long contentLength = -1;
+      unsigned long headerStartedAt = millis();
+      while (!headersDone && millis() - headerStartedAt < 10000) {
+        while (client.available()) {
+          String line = client.readStringUntil('\n');
+          while (line.length() && (line[line.length() - 1] == '\r' || line[line.length() - 1] == '\n')) line.remove(line.length() - 1);
+          if (statusLine.length() == 0) {
+            statusLine = line;
+            int sp1 = line.indexOf(' ');
+            int sp2 = line.indexOf(' ', sp1 + 1);
+            if (sp1 > 0 && sp2 > sp1) status = line.substring(sp1 + 1, sp2).toInt();
+          } else if (line.length() == 0) {
+            headersDone = true;
+            break;
+          } else if (line.startsWith("Content-Length:") || line.startsWith("content-length:")) {
+            contentLength = line.substring(line.indexOf(':') + 1).toInt();
+          }
+        }
+        if (!client.connected() && !client.available()) break;
+      }
+
+      // Read the response body for a 400+ error rather than trusting client.lastError() -- that
+      // surfaces SSL-library errors, not HTTP error text, so using it here would silently swallow
+      // whatever the server actually said.
+      if (status != 200) {
+        String body;
+        unsigned long bodyStart = millis();
+        while (millis() - bodyStart < 5000 && (client.available() || client.connected())) {
+          while (client.available() && body.length() < 200) body += (char)client.read();
+        }
+        client.stop();
+        recordOtaFailure(String("download: HTTP ") + status + ": " + body);
+        return;
+      }
+      if (contentLength <= 0) {
+        client.stop();
+        recordOtaFailure(F("download: missing/invalid Content-Length"));
+        return;
+      }
+
+      if (!Update.begin((size_t)contentLength)) {
+        client.stop();
+        recordOtaFailure(F("download: Update.begin() failed (not enough free space?)"));
+        return;
+      }
+      Serial.print(F("glowline ota: free heap after Update.begin(): "));
+      Serial.println(ESP.getFreeHeap());
+
+      mbedtls_sha256_context shaCtx;
+      mbedtls_sha256_init(&shaCtx);
+      mbedtls_sha256_starts(&shaCtx, 0);
+
+      uint8_t buf[512];
+      long remaining = contentLength;
+      unsigned long lastByteAt = millis();
+      bool streamError = false;
+      while (remaining > 0) {
+        int avail = client.available();
+        if (avail > 0) {
+          int toRead = avail > (int)sizeof(buf) ? (int)sizeof(buf) : avail;
+          if (toRead > remaining) toRead = (int)remaining;
+          int n = client.read(buf, toRead);
+          if (n > 0) {
+            mbedtls_sha256_update(&shaCtx, buf, n);
+            Update.write(buf, n);
+            remaining -= n;
+            lastByteAt = millis();
+          }
+        } else if (!client.connected()) {
+          streamError = true;
+          break;
+        } else if (millis() - lastByteAt > 15000) {
+          Serial.println(F("glowline ota: download stalled, aborting"));
+          streamError = true;
+          break;
+        }
+      }
+      client.stop();
+
+      if (streamError || remaining > 0) {
+        mbedtls_sha256_free(&shaCtx);
+        Update.abort();
+        recordOtaFailure(F("download: connection dropped before completion"));
+        return;
+      }
+
+      uint8_t hash[32];
+      mbedtls_sha256_finish(&shaCtx, hash);
+      mbedtls_sha256_free(&shaCtx);
+
+      char hashHex[65];
+      for (int i = 0; i < 32; i++) snprintf(&hashHex[i * 2], 3, "%02x", hash[i]);
+      hashHex[64] = '\0';
+
+      String expected = sha256Hex;
+      expected.toLowerCase();
+      if (String(hashHex) != expected) {
+        Serial.print(F("glowline ota: SHA-256 MISMATCH, got "));
+        Serial.print(hashHex);
+        Serial.print(F(", expected "));
+        Serial.println(expected);
+        Update.abort();
+        recordOtaFailure(F("download: sha256 mismatch"));
+        return;
+      }
+
+      // Only past this point does anything touch the boot partition selector -- see this
+      // usermod's confirmation (readme/commit message) that a power loss at any point before here
+      // leaves the currently-running, already-working image untouched.
+      if (!Update.end(true)) {
+        recordOtaFailure(F("download: Update.end() failed"));
+        return;
+      }
+
+      Serial.println(F("glowline ota: update written and verified, rebooting"));
+      ESP.restart();
+    }
+
+    // Manifest check: sub-second. Runs once per WS CONNECTED transition (called from
+    // pollHandshake()), gated by otaCheckBlockedUntil so a flapping connection can't hammer
+    // /ota/check.
+    void checkForOtaUpdate() {
+      if ((long)(millis() - otaCheckBlockedUntil) < 0) return;
+      otaCheckBlockedUntil = millis() + OTA_CHECK_COOLDOWN_MS;
+
+      Serial.print(F("glowline ota: free heap before /ota/check: "));
+      Serial.println(ESP.getFreeHeap());
+
+      String path = String("/ota/check?device=") + urlEncode(wsDeviceId) + "&token=" + urlEncode(wsToken) + "&fw=" + urlEncode(String(F(GLOWLINE_FW_VERSION)));
+
+      int status = 0;
+      String body;
+      int retryAfterSec = -1;
+      if (!httpGetSmall(wsHost, wsPort, path, status, body, retryAfterSec)) {
+        Serial.println(F("glowline ota: /ota/check request failed (connection-level)"));
+        return; // transient -- the next CONNECTED (or reconnect) tries again
+      }
+
+      if (status == 204) {
+        Serial.println(F("glowline ota: /ota/check -- 204, nothing to do"));
+        return;
+      }
+      if (status == 429) {
+        unsigned long retryMs = (retryAfterSec > 0) ? (unsigned long)retryAfterSec * 1000UL : OTA_CHECK_COOLDOWN_MS;
+        if (retryMs < OTA_CHECK_COOLDOWN_MS) retryMs = OTA_CHECK_COOLDOWN_MS;
+        otaCheckBlockedUntil = millis() + retryMs;
+        Serial.print(F("glowline ota: /ota/check -- 429, backing off "));
+        Serial.print(retryMs);
+        Serial.println(F(" ms"));
+        return;
+      }
+      if (status >= 400) {
+        Serial.print(F("glowline ota: /ota/check -- HTTP "));
+        Serial.print(status);
+        Serial.print(F(": "));
+        Serial.println(body);
+        return;
+      }
+      if (status != 200) {
+        Serial.print(F("glowline ota: /ota/check -- unexpected status "));
+        Serial.println(status);
+        return;
+      }
+
+      // Own small JSON document rather than WLED's shared pDoc -- pDoc is sized for WLED state
+      // JSON, and this runs from inside the WS-connected path, not guaranteed free of a
+      // concurrent applyJsonState() use.
+      StaticJsonDocument<1024> manifestDoc;
+      DeserializationError err = deserializeJson(manifestDoc, body);
+      if (err) {
+        Serial.print(F("glowline ota: manifest is not valid JSON: "));
+        Serial.println(err.c_str());
+        return;
+      }
+      String version = manifestDoc["version"] | "";
+      uint32_t size = manifestDoc["size"] | 0;
+      String url = manifestDoc["url"] | "";
+      String sha256 = manifestDoc["sha256"] | "";
+      String keyId = manifestDoc["keyId"] | "";
+      String signature = manifestDoc["signature"] | "";
+      if (version.length() == 0 || size == 0 || url.length() == 0 || sha256.length() == 0 || keyId.length() == 0 || signature.length() == 0) {
+        Serial.println(F("glowline ota: manifest missing required field(s)"));
+        return;
+      }
+
+      if (version == otaKnownBadVersion) {
+        Serial.print(F("glowline ota: refusing known-bad version locally: "));
+        Serial.println(version);
+        return;
+      }
+
+      if (!verifyManifestSignature(version, size, sha256, keyId, signature)) return; // already logged why
+
+      performOtaDownload(version, size, url, sha256);
+    }
+
   public:
     void setup() {
+      // Printed unconditionally, on every boot (including the one right after a rollback) --
+      // across multiple flashed versions and a rollback in flight, this is the one thing that
+      // says at a glance which build is actually running. Set per release via build_flags
+      // (-D GLOWLINE_FW_VERSION=\"1.2.0\"); see the readme for the exact command.
+      Serial.println(F("================================================================"));
+      Serial.print(F("= glowline firmware version: "));
+      Serial.println(F(GLOWLINE_FW_VERSION));
+      Serial.println(F("================================================================"));
+
+#if OTA_VERIFY_TIMEOUT_MS != (15UL * 60UL * 1000UL)
+      // Impossible to miss in serial -- the *_BENCH_..._DO_NOT_SHIP env drops the rollback
+      // confirmation window from 15 minutes to something bench-test-sized. If this ever prints on
+      // a real unit, that unit was flashed with the wrong environment.
+      Serial.println(F("################################################################"));
+      Serial.println(F("# glowline: BENCH BUILD -- OTA rollback timeout is NOT 15 minutes #"));
+      Serial.print(F("# Actual timeout (ms): "));
+      Serial.println((unsigned long)OTA_VERIFY_TIMEOUT_MS);
+      Serial.println(F("# DO NOT SHIP THIS BUILD TO A REAL UNIT"));
+      Serial.println(F("################################################################"));
+#endif
+
       // "rmt" tag spams a "flush timeout" error on every non-blocking poll of
       // rmt_tx_wait_all_done() -- a cosmetic ESP-IDF logging bug
       // (espressif/esp-idf#17527), not an actual failure. It floods the
       // serial line badly enough to bury real output, so silence it.
       esp_log_level_set("rmt", ESP_LOG_NONE);
+
+      // OTA rollback detection: PENDING_VERIFY only happens right after a fresh OTA flash --
+      // never after a USB/factory flash or an already-confirmed reboot. Mark-valid (clearing this)
+      // happens only in pollHandshake()'s CONNECTED branch, never here and never on WiFi
+      // association alone -- see that comment for why.
+      const esp_partition_t* runningPartition = esp_ota_get_running_partition();
+      esp_ota_img_states_t otaState;
+      if (runningPartition && esp_ota_get_state_partition(runningPartition, &otaState) == ESP_OK && otaState == ESP_OTA_IMG_PENDING_VERIFY) {
+        otaPendingVerify = true;
+        otaBootTime = millis();
+        Serial.println(F("glowline ota: running image is PENDING_VERIFY -- awaiting a successful WS connect to confirm"));
+      }
+
+      {
+        Preferences prefs;
+        prefs.begin("ota", true); // read-only
+        otaKnownBadVersion = prefs.getString("failedVer", "");
+        otaRollbackReportPending = prefs.getBool("rbPending", false);
+        prefs.end();
+      }
+      if (otaRollbackReportPending && otaKnownBadVersion.length() > 0) {
+        Serial.print(F("glowline ota: booted after a rollback from version "));
+        Serial.print(otaKnownBadVersion);
+        Serial.println(F(" -- will report once connected"));
+      }
 
       // Start the boot cue immediately, before WLED's own first render:
       // beginStrip() (which runs just before usermod setup()) sets bri/color
@@ -593,6 +1202,22 @@ class GlowlineUsermod : public Usermod {
 
     void loop() {
       advanceBootCue();
+
+      // Rollback timeout: unaffected by anything else in loop() being blocked (the OTA
+      // check/download sequence runs on the OLD, already-confirmed image, before any reboot --
+      // otaPendingVerify is only ever true on a *different* boot, the one right after flashing the
+      // new image, when nothing here blocks loop() at all). Checked unconditionally, independent
+      // of WiFi/wss state, so a build that can't even associate to WiFi still rolls back instead
+      // of bricking silently forever.
+      if (otaPendingVerify && millis() - otaBootTime > OTA_VERIFY_TIMEOUT_MS) {
+        Serial.println(F("glowline ota: not confirmed within timeout -- persisting failure and rolling back"));
+        Preferences prefs;
+        prefs.begin("ota", false);
+        prefs.putString("failedVer", String(F(GLOWLINE_FW_VERSION)));
+        prefs.putBool("rbPending", true);
+        prefs.end();
+        esp_ota_mark_app_invalid_rollback_and_reboot(); // does not return on success
+      }
 
       if (millis() - lastTime_ >= INTERVAL_MS) {
         lastTime_ = millis();
@@ -673,6 +1298,19 @@ class GlowlineUsermod : public Usermod {
       configComplete &= getJsonValue(top[F("port")], wsPort, (uint16_t)0);
       configComplete &= getJsonValue(top[F("deviceId")], wsDeviceId, String(""));
       configComplete &= getJsonValue(top[F("token")], wsToken, String(""));
+
+#ifdef GLOWLINE_OTA_TEST_FORCE_BAD_HOST
+      // OTA rollback bench-testing only: ignore whatever host is actually saved in Settings ->
+      // Usermods (that config lives in cfg.json on the filesystem partition, which an OTA app
+      // update never touches -- a real "broken" OTA build would otherwise just keep using the
+      // correct, already-working host and never actually fail). example.com resolves and
+      // completes a TLS handshake, so beginConnect() gets past DNS/TCP/TLS, but it isn't a
+      // WebSocket server, so pollHandshake() never sees a 101 and CONNECTED never fires --
+      // mark-valid never runs, and the rollback timeout in loop() eventually fires for real.
+      // NEVER define this flag in a build meant to run for real.
+      wsHost = "example.com";
+      wsPort = 443;
+#endif
 
       // Apply new settings: drop any existing connection and reconnect
       // immediately, whether this is the initial boot load or a change
