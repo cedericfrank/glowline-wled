@@ -33,6 +33,15 @@
 #define OTA_VERIFY_TIMEOUT_MS (15UL * 60UL * 1000UL)
 #endif
 
+// GLOWLINE_OTA_TEST_FORCE_BAD_HOST (readFromConfig(), below) permanently breaks this build's
+// ability to ever reach the backend -- it must never be paired with the real 15-minute rollback
+// timeout, or a mistake here means a device that can't be recovered without a USB cable for 15
+// real minutes instead of 2. Requiring the bench timeout alongside it makes that pairing a build
+// failure instead of a runtime surprise.
+#if defined(GLOWLINE_OTA_TEST_FORCE_BAD_HOST) && (OTA_VERIFY_TIMEOUT_MS == (15UL * 60UL * 1000UL))
+#error "GLOWLINE_OTA_TEST_FORCE_BAD_HOST requires the bench rollback timeout -- build with the *_BENCH_..._DO_NOT_SHIP env (or otherwise override OTA_VERIFY_TIMEOUT_MS), never with the real 15-minute default."
+#endif
+
 /*
  * Diagnostic + control usermod: bridges WLED to a Glowline backend over
  * WebSocket, applying whatever state it's sent.
@@ -1120,6 +1129,14 @@ class GlowlineUsermod : public Usermod {
       Serial.println(F("# glowline: BENCH BUILD -- OTA rollback timeout is NOT 15 minutes #"));
       Serial.print(F("# Actual timeout (ms): "));
       Serial.println((unsigned long)OTA_VERIFY_TIMEOUT_MS);
+      Serial.println(F("# DO NOT SHIP THIS BUILD TO A REAL UNIT"));
+      Serial.println(F("################################################################"));
+#endif
+
+#ifdef GLOWLINE_OTA_TEST_FORCE_BAD_HOST
+      Serial.println(F("################################################################"));
+      Serial.println(F("# glowline: OTA TEST BUILD -- wsHost is FORCED to example.com   #"));
+      Serial.println(F("# This build can NEVER complete a real WebSocket connection.    #"));
       Serial.println(F("# DO NOT SHIP THIS BUILD TO A REAL UNIT"));
       Serial.println(F("################################################################"));
 #endif
