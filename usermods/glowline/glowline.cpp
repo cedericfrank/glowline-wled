@@ -694,22 +694,24 @@ class GlowlineUsermod : public Usermod {
     // Exponential backoff on SSL/connection failures specifically (500ms, 1s, 2s -- max 3 tries),
     // never on HTTP-level errors (those fail immediately below, no retry). Credited: this exact
     // schedule, and the reasoning (ESP32 TLS hardware-accelerator flakiness under load), come from
-    // the reference OTA implementation docs/OTA.md Section 2 compares against. Reuses the same
-    // `client` member as the wss link -- by the time this is ever called, that link has already
-    // been closed (see performOtaDownload()), so only one TLS session is ever live at a time.
-    bool connectHttpsWithRetry(const String& host, uint16_t port) {
+    // the reference OTA implementation docs/OTA.md Section 2 compares against. Takes the client to
+    // use as a parameter rather than assuming the shared wss `client` member: the download reuses
+    // that member deliberately (after explicitly closing the wss link first -- see
+    // performOtaDownload()), but /ota/check must NOT touch it at all, since the wss link is still
+    // live at that point (see checkForOtaUpdate(), which passes its own local WiFiClientSecure).
+    bool connectHttpsWithRetry(WiFiClientSecure& c, const String& host, uint16_t port) {
       static const unsigned long kDelaysMs[] = {500, 1000, 2000};
       for (int attempt = 0; attempt < 3; attempt++) {
-        client.setInsecure(); // same known debt as the wss connection -- see file header comment
-        client.setHandshakeTimeout(10);
-        client.setPlainStart();
-        if (client.connect(host.c_str(), port, 10000) && client.startTLS()) {
+        c.setInsecure(); // same known debt as the wss connection -- see file header comment
+        c.setHandshakeTimeout(10);
+        c.setPlainStart();
+        if (c.connect(host.c_str(), port, 10000) && c.startTLS()) {
           return true;
         }
         Serial.print(F("glowline ota: connect/TLS attempt "));
         Serial.print(attempt + 1);
         Serial.println(F(" failed"));
-        client.stop();
+        c.stop();
         if (attempt < 2) delay(kDelaysMs[attempt]);
       }
       return false;
@@ -719,25 +721,29 @@ class GlowlineUsermod : public Usermod {
     // body. Never used for the firmware binary itself (see performOtaDownload(), which streams
     // straight into Update.write() without ever buffering the whole thing). Uses
     // "Connection: close" so end-of-body is just end-of-stream, no chunked-transfer handling
-    // needed for these small, server-controlled responses.
-    bool httpGetSmall(const String& host, uint16_t port, const String& path, int& status, String& body, int& retryAfterSec) {
+    // needed for these small, server-controlled responses. `c` is caller-owned -- see
+    // connectHttpsWithRetry()'s comment on why this never assumes the shared wss `client` member.
+    bool httpGetSmall(WiFiClientSecure& c, const String& host, uint16_t port, const String& path, int& status, String& body, int& retryAfterSec) {
       status = 0;
       body = "";
       retryAfterSec = -1;
-      if (!connectHttpsWithRetry(host, port)) return false;
+      if (!connectHttpsWithRetry(c, host, port)) return false;
 
-      client.print(F("GET "));
-      client.print(path);
-      client.print(F(" HTTP/1.1\r\nHost: "));
-      client.print(host);
-      client.print(F("\r\nConnection: close\r\n\r\n"));
+      Serial.print(F("glowline ota: free heap after /ota/check TLS handshake: "));
+      Serial.println(ESP.getFreeHeap());
+
+      c.print(F("GET "));
+      c.print(path);
+      c.print(F(" HTTP/1.1\r\nHost: "));
+      c.print(host);
+      c.print(F("\r\nConnection: close\r\n\r\n"));
 
       String statusLine = "";
       bool headersDone = false;
       unsigned long startedAt = millis();
       while (millis() - startedAt < 10000) {
-        while (client.available()) {
-          String line = client.readStringUntil('\n');
+        while (c.available()) {
+          String line = c.readStringUntil('\n');
           while (line.length() && (line[line.length() - 1] == '\r' || line[line.length() - 1] == '\n')) line.remove(line.length() - 1);
           if (!headersDone) {
             if (statusLine.length() == 0) {
@@ -755,9 +761,9 @@ class GlowlineUsermod : public Usermod {
             body += '\n';
           }
         }
-        if (!client.connected() && !client.available()) break;
+        if (!c.connected() && !c.available()) break;
       }
-      client.stop();
+      c.stop();
       return statusLine.length() > 0;
     }
 
@@ -898,7 +904,7 @@ class GlowlineUsermod : public Usermod {
       Serial.print(F("glowline ota: free heap after closing wss link: "));
       Serial.println(ESP.getFreeHeap());
 
-      if (!connectHttpsWithRetry(host, port)) {
+      if (!connectHttpsWithRetry(client, host, port)) {
         recordOtaFailure(F("download: connect/TLS failed"));
         return;
       }
@@ -1034,7 +1040,15 @@ class GlowlineUsermod : public Usermod {
 
     // Manifest check: sub-second. Runs once per WS CONNECTED transition (called from
     // pollHandshake()), gated by otaCheckBlockedUntil so a flapping connection can't hammer
-    // /ota/check.
+    // /ota/check. Uses its own WiFiClientSecure, entirely separate from the wss `client` member --
+    // that link is still live at this point (the download is the only thing that closes it first,
+    // deliberately, because it's a multi-megabyte transfer worth avoiding two concurrent TLS
+    // sessions for; this check is small and must not disturb a working connection). Confirmed on
+    // hardware: reusing `client` here tore down the live wss socket immediately, and the request
+    // itself then failed too -- every check was silently killing the connection it ran inside of.
+    // Free heap at check time comfortably covers a second TLS session (measured: ~155KB free
+    // before the check, ~41KB for a handshake, leaving ~114KB) -- see the heap log right after
+    // connect below, and confirm it holds on real hardware, not just this arithmetic.
     void checkForOtaUpdate() {
       if ((long)(millis() - otaCheckBlockedUntil) < 0) return;
       otaCheckBlockedUntil = millis() + OTA_CHECK_COOLDOWN_MS;
@@ -1044,12 +1058,13 @@ class GlowlineUsermod : public Usermod {
 
       String path = String("/ota/check?device=") + urlEncode(wsDeviceId) + "&token=" + urlEncode(wsToken) + "&fw=" + urlEncode(String(F(GLOWLINE_FW_VERSION)));
 
+      WiFiClientSecure otaCheckClient;
       int status = 0;
       String body;
       int retryAfterSec = -1;
-      if (!httpGetSmall(wsHost, wsPort, path, status, body, retryAfterSec)) {
-        Serial.println(F("glowline ota: /ota/check request failed (connection-level)"));
-        return; // transient -- the next CONNECTED (or reconnect) tries again
+      if (!httpGetSmall(otaCheckClient, wsHost, wsPort, path, status, body, retryAfterSec)) {
+        Serial.println(F("glowline ota: /ota/check request failed (connection-level) -- wss link untouched"));
+        return; // transient -- the next CONNECTED (or reconnect) tries again; never touches wsState/client
       }
 
       if (status == 204) {
