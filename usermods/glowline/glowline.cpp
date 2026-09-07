@@ -42,6 +42,28 @@
 #error "GLOWLINE_OTA_TEST_FORCE_BAD_HOST requires the bench rollback timeout -- build with the *_BENCH_..._DO_NOT_SHIP env (or otherwise override OTA_VERIFY_TIMEOUT_MS), never with the real 15-minute default."
 #endif
 
+// Hardware finding: after a real OTA update, esp_ota_get_state_partition() read back VALID, not
+// PENDING_VERIFY, at the top of setup() -- before any of this usermod's own code had run. Traced
+// to Arduino-ESP32 core's own initArduino() (esp32-hal-misc.c), which runs before setup() and,
+// under CONFIG_APP_ROLLBACK_ENABLE, automatically calls esp_ota_mark_app_valid_cancel_rollback()
+// on any PENDING_VERIFY image using its own default weak verifyOta() (unconditionally returns
+// true). That auto-confirms every OTA update instantly, silently overriding this usermod's entire
+// "only confirm on a proven WS CONNECTED" design before it ever gets a chance to run -- this is
+// NOT evidence that rollback support is missing from either the bootloader or the app; getting
+// this far at all requires both halves to be compiled in correctly (the bootloader had to have
+// promoted NEW -> PENDING_VERIFY for initArduino() to see it and act).
+//
+// verifyRollbackLater() is Arduino-ESP32's own documented escape hatch for exactly this case: a
+// weak hook that, overridden to return true, makes initArduino() skip its automatic check
+// entirely and defer to the application. This usermod's own PENDING_VERIFY/mark-valid/timeout
+// logic (setup()/pollHandshake()/loop(), below) becomes the sole decision-maker once this is in
+// place -- exactly as designed, now actually reachable.
+#ifdef CONFIG_APP_ROLLBACK_ENABLE
+extern "C" bool verifyRollbackLater() {
+  return true;
+}
+#endif
+
 /*
  * Diagnostic + control usermod: bridges WLED to a Glowline backend over
  * WebSocket, applying whatever state it's sent.
