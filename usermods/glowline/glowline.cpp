@@ -1167,8 +1167,28 @@ class GlowlineUsermod : public Usermod {
       // happens only in pollHandshake()'s CONNECTED branch, never here and never on WiFi
       // association alone -- see that comment for why.
       const esp_partition_t* runningPartition = esp_ota_get_running_partition();
-      esp_ota_img_states_t otaState;
-      if (runningPartition && esp_ota_get_state_partition(runningPartition, &otaState) == ESP_OK && otaState == ESP_OTA_IMG_PENDING_VERIFY) {
+      esp_ota_img_states_t otaState = (esp_ota_img_states_t)0xFF; // sentinel: "call never happened"
+      esp_err_t otaStateErr = runningPartition ? esp_ota_get_state_partition(runningPartition, &otaState) : ESP_ERR_NOT_FOUND;
+      // Unconditional, deliberately -- silently checking `== PENDING_VERIFY` gave no signal at all
+      // when this returned something else entirely. Print the raw values every boot, not just
+      // when they match what we expect.
+      Serial.print(F("glowline ota: esp_ota_get_state_partition() err="));
+      Serial.print((int)otaStateErr);
+      Serial.print(F(" state="));
+      Serial.print((int)otaState);
+      Serial.print(F(" ("));
+      switch (otaState) {
+        case ESP_OTA_IMG_NEW:             Serial.print(F("NEW")); break;
+        case ESP_OTA_IMG_PENDING_VERIFY:  Serial.print(F("PENDING_VERIFY")); break;
+        case ESP_OTA_IMG_VALID:           Serial.print(F("VALID")); break;
+        case ESP_OTA_IMG_INVALID:         Serial.print(F("INVALID")); break;
+        case ESP_OTA_IMG_ABORTED:         Serial.print(F("ABORTED")); break;
+        case ESP_OTA_IMG_UNDEFINED:       Serial.print(F("UNDEFINED")); break;
+        default:                          Serial.print(F("UNKNOWN/sentinel")); break;
+      }
+      Serial.println(F(")"));
+
+      if (otaStateErr == ESP_OK && otaState == ESP_OTA_IMG_PENDING_VERIFY) {
         otaPendingVerify = true;
         otaBootTime = millis();
         Serial.println(F("glowline ota: running image is PENDING_VERIFY -- awaiting a successful WS connect to confirm"));
