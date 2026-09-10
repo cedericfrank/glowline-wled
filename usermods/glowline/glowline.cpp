@@ -33,6 +33,20 @@
 #define OTA_VERIFY_TIMEOUT_MS (15UL * 60UL * 1000UL)
 #endif
 
+// Opt-in cap on how many LEDs the boot cue and OTA-updating cue will ever drive directly
+// (handleOverlayDraw(), showOtaUpdatingCue(), below). Both bypass WLED's normal effect pipeline
+// with raw strip.setPixelColor()/strip.show() calls, using strip.getLengthTotal() -- whatever LED
+// count is currently configured -- with no limit of its own by default (UINT16_MAX below is not a
+// real limit, strip.getLengthTotal() can't exceed it). Deliberately NOT capped at some single
+// number for every unit -- household units vary: some are direct board-powered (no separate
+// supply, a real current ceiling applies), others have aux power added and are correctly built
+// with a much higher LED count that this must not truncate. Set this per-build, per-unit, only
+// for hardware that actually needs a ceiling below its own configured LED count -- e.g.
+// -D GLOWLINE_CUE_MAX_LEDS=20 for a board-powered build with no separate supply.
+#ifndef GLOWLINE_CUE_MAX_LEDS
+#define GLOWLINE_CUE_MAX_LEDS 65535
+#endif
+
 // GLOWLINE_OTA_TEST_FORCE_BAD_HOST (readFromConfig(), below) permanently breaks this build's
 // ability to ever reach the backend -- it must never be paired with the real 15-minute rollback
 // timeout, or a mistake here means a device that can't be recovered without a USB cable for 15
@@ -852,6 +866,7 @@ class GlowlineUsermod : public Usermod {
       bri = OTA_CUE_BRI;
       offMode = false;
       uint16_t total = strip.getLengthTotal();
+      if (total > GLOWLINE_CUE_MAX_LEDS) total = GLOWLINE_CUE_MAX_LEDS; // see GLOWLINE_CUE_MAX_LEDS's comment
       for (uint16_t i = 0; i < total; i++) strip.setPixelColor(i, RGBW32(0, 0, 255, 0));
       strip.show();
     }
@@ -1247,6 +1262,7 @@ class GlowlineUsermod : public Usermod {
     void handleOverlayDraw() {
       if (bootCuePhase == BootCuePhase::CUE_DONE) return;
       uint16_t total = strip.getLengthTotal();
+      if (total > GLOWLINE_CUE_MAX_LEDS) total = GLOWLINE_CUE_MAX_LEDS; // see GLOWLINE_CUE_MAX_LEDS's comment
       uint32_t color;
       uint16_t lit = total;
       switch (bootCuePhase) {
