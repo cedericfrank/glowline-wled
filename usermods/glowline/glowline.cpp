@@ -380,6 +380,7 @@ class GlowlineUsermod : public Usermod {
       client.print(urlEncode(wsToken));
       client.print(F("&fw="));
       client.print(urlEncode(String(F(GLOWLINE_FW_VERSION))));
+      client.print(F("&caps=heartbeat,probe,ack"));
       client.print(F(" HTTP/1.1\r\n"));
       client.print(F("Host: "));
       client.print(wsHost);
@@ -528,6 +529,52 @@ class GlowlineUsermod : public Usermod {
       applyJsonState((const uint8_t*)kWhite, strlen(kWhite));
     }
 
+    // Dispatches one inbound text frame per docs/DELIVERY-ACK.md Section 3: a server
+    // probe gets an immediate probe_reply; an enveloped glow push ({"v":1,"id":...,
+    // "state":{...}}) is unwrapped and handed to deserializeState(), acked or nacked
+    // by id; anything else (including a non-JSON "pong" reply to our own heartbeat,
+    // or a device that predates this envelope) falls back to today's raw-state path.
+    void handleTextFrame(const uint8_t* payload, size_t len) {
+      if (!requestJSONBufferLock(JSON_LOCK_UNKNOWN)) {
+        Serial.println(F("glowline ws: JSON buffer busy, not applied"));
+        return;
+      }
+      DeserializationError error = deserializeJson(*pDoc, payload, len);
+      JsonObject root = pDoc->as<JsonObject>();
+      if (error || root.isNull()) {
+        releaseJSONBufferLock();
+        return; // not JSON at all -- harmless, matches applyJsonState()'s own error path
+      }
+
+      const char* type = root["type"] | (const char*)nullptr;
+      if (type && strcmp(type, "probe") == 0) {
+        String id = sanitizeForJsonString(String((const char*)(root["id"] | "")));
+        releaseJSONBufferLock();
+        String msg = String("{\"type\":\"probe_reply\",\"id\":\"") + id + "\"}";
+        sendFrame(0x1, (const uint8_t*)msg.c_str(), msg.length());
+        return;
+      }
+
+      if (root.containsKey("v") && root.containsKey("id") && root.containsKey("state")) {
+        String id = sanitizeForJsonString(String((const char*)(root["id"] | "")));
+        JsonObject state = root["state"];
+        bool stateMissing = state.isNull();
+        bool ok = !stateMissing && deserializeState(state);
+        releaseJSONBufferLock();
+        String reason = stateMissing ? "missing state" : "deserializeState failed";
+        String msg = ok
+          ? String("{\"type\":\"state_applied\",\"id\":\"") + id + "\"}"
+          : String("{\"type\":\"state_rejected\",\"id\":\"") + id + "\",\"reason\":\"" + reason + "\"}";
+        sendFrame(0x1, (const uint8_t*)msg.c_str(), msg.length());
+        return;
+      }
+
+      // Legacy fallback: raw un-enveloped state push, same behavior as today.
+      deserializeState(root);
+      releaseJSONBufferLock();
+      Serial.println(F("glowline ws: applied to WLED state"));
+    }
+
     void finishFrame() {
       lastInboundAt = millis(); // any complete frame counts as proof the connection is alive
       size_t len = (size_t)((payloadIdx < MAX_FRAME_PAYLOAD) ? payloadIdx : MAX_FRAME_PAYLOAD);
@@ -538,7 +585,7 @@ class GlowlineUsermod : public Usermod {
           Serial.write(frameBuf, len);
           if (payloadIdx > MAX_FRAME_PAYLOAD) Serial.print(F(" ...[truncated]"));
           Serial.println();
-          applyJsonState(frameBuf, len);
+          handleTextFrame(frameBuf, len);
           break;
         case 0x8: // close
           Serial.println(F("glowline ws: received close frame"));
@@ -636,6 +683,11 @@ class GlowlineUsermod : public Usermod {
         lastPingSentAt = now;
         Serial.println(F("glowline ws: sending ping"));
         sendFrame(0x9, nullptr, 0);
+        // App-level heartbeat (docs/DELIVERY-ACK.md caps=heartbeat) -- distinct from the
+        // control-frame ping above: the server answers this via its hibernation
+        // auto-response without waking the Durable Object, and tracks it for staleness.
+        static const char kHeartbeat[] = "ping";
+        sendFrame(0x1, (const uint8_t*)kHeartbeat, strlen(kHeartbeat));
       }
     }
 

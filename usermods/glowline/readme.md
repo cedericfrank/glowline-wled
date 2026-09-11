@@ -6,20 +6,33 @@ brightness, etc.
 
 ## What it does
 
-- Connects to `wss://<host>:<port>/ws?device=<deviceId>&token=<token>`. Host,
-  port, device ID and token are all configured at runtime via **Settings ->
-  Usermods** — nothing is hardcoded or baked into the build.
-- Sends a `hello` message on connect, and applies every JSON message it
-  receives directly to WLED's own state (the same `deserializeState()` path
-  used by the JSON API, so a message can turn the strip on, change color,
-  effects, brightness, etc).
+- Connects to `wss://<host>:<port>/ws?device=<deviceId>&token=<token>&fw=<version>&caps=heartbeat,probe,ack`.
+  Host, port, device ID and token are all configured at runtime via
+  **Settings -> Usermods** — nothing is hardcoded or baked into the build.
+  `caps` advertises the delivery-ack protocol capabilities this build
+  supports (see `docs/DELIVERY-ACK.md`); the server falls back to legacy
+  behavior for any capability it doesn't see listed.
+- Sends a `hello` message on connect. Every inbound text frame is
+  type-dispatched (`docs/DELIVERY-ACK.md` Section 3):
+  - `{"type":"probe","id":...}` gets an immediate `{"type":"probe_reply","id":...}`.
+  - `{"v":1,"id":...,"state":{...}}` — an acknowledged glow push — has its
+    `state` unwrapped and applied via WLED's own `deserializeState()` path
+    (the same one used by the JSON API), then replies
+    `{"type":"state_applied","id":...}` on success or
+    `{"type":"state_rejected","id":...,"reason":...}` on failure.
+  - Anything else (a non-JSON reply like the server's `"pong"`, or a legacy
+    raw un-enveloped state push) falls back to applying it directly to
+    WLED's state, unchanged from before.
 - Reconnects with exponential backoff (1s doubling up to a 60s cap) whenever
   the connection drops.
-- While connected, sends a ping every 30s and requires *something* back (a
-  pong, or any other inbound frame) within 90s. A TCP socket can report
+- While connected, sends both a control-frame ping and an app-level `"ping"`
+  text-frame heartbeat every 30s, and requires *something* back (a pong, or
+  any other inbound frame) within 90s. A TCP socket can report
   `connected() == true` while the path is actually dead; this liveness check
   is what catches that and forces a reconnect instead of sitting on a socket
-  that looks fine but never delivers anything again.
+  that looks fine but never delivers anything again. The app-level heartbeat
+  additionally lets the server track staleness via its own hibernation
+  auto-response mechanism without waking its Durable Object.
 - The first time a config change (a Settings -> Usermods save, not just a
   plain reboot) leads to a successful connection, it plays an unmistakable
   "setup worked" cue: brief full-brightness green, then settles to solid

@@ -6,6 +6,7 @@
 .pio
 .pioenvs
 .piolibdeps
+.venv-pio
 .vscode
 compile_commands.json
 __pycache__/
