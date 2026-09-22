@@ -34,3 +34,6 @@ wled-update.sh
 /wled00/wled00.ino.cpp
 /wled00/html_*.h
 /wled00/js_*.h
+
+# Signed OTA release output (tools/sign-release.mjs) -- never commit signed binaries
+/dist/
