@@ -1,0 +1,12 @@
+# Normalize line endings to LF (guards against CRLF damage from Windows checkouts).
+* text=auto eol=lf
+
+# Upstream WLED files that are CRLF in wled/WLED itself -- left as-is to avoid churn.
+boards/lolin_s3_mini.json -text
+lib/NeoESP32RmtHI/include/NeoEsp32RmtHIMethod.h -text
+tools/udp_test.py -text
+usermods/BH1750_v2/BH1750_v2.h -text
+usermods/PIR_sensor_switch/PIR_sensor_switch.cpp -text
+usermods/SN_Photoresistor/SN_Photoresistor.h -text
+usermods/usermod_v2_animartrix/library.json -text
+usermods/usermod_v2_four_line_display_ALT/usermod_v2_four_line_display.h -text
