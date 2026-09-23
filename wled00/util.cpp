@@ -175,7 +175,7 @@ void getWLEDhostname(char* hostname, size_t maxLen, bool preferMDNS) {
     strlcpy(hostname, cmDNS, maxLen);
     sanitizeHostname(hostname, maxLen);  // sanitize cmDNS name
     if (strlen(hostname) < 1) {          // if result is empty -> fall back to wled-MAC
-      snprintf_P(hostname, maxLen, PSTR("wled-%*s"), 6, escapedMac.c_str() + 6);
+      snprintf_P(hostname, maxLen, PSTR(GLOWLINE_MDNS_PREFIX "-%*s"), 6, escapedMac.c_str() + 6);
       hostname[maxLen -1] = '\0';        // ensure string termination
     }
   } else {
