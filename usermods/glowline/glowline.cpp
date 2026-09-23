@@ -58,6 +58,10 @@
 #ifndef LUMEN_DEVICE_PORT
 #define LUMEN_DEVICE_PORT 443
 #endif
+// LUMEN_LEGACY_HOST (prod env only, deliberately no default): a board whose saved host is exactly
+// this string is moved to LUMEN_DEVICE_HOST -- in memory only until the first CONNECTED on the new
+// host (confirmHostMigration()). Until then cfg.json keeps the legacy host, so if the new host
+// fails and the image rolls back, the old image still dials the legacy host and can report it.
 
 // GLOWLINE_OTA_TEST_FORCE_BAD_HOST (readFromConfig(), below) permanently breaks this build's
 // ability to ever reach the backend -- it must never be paired with the real 15-minute rollback
@@ -161,6 +165,10 @@ class GlowlineUsermod : public Usermod {
     uint16_t wsPort = 0;
     String wsDeviceId = "";
     String wsToken = "";
+    // Legacy-host migration (see LUMEN_LEGACY_HOST): true while wsHost holds the new host but
+    // cfg.json must keep the legacy one; legacyPort is the port saved alongside it.
+    bool hostMigrationPending = false;
+    uint16_t legacyPort = 0;
 
     // TLS connection
     WiFiClientSecure client;
@@ -409,6 +417,14 @@ class GlowlineUsermod : public Usermod {
     }
 
     // Returns true once the handshake has concluded (success or failure).
+    // Called once per CONNECTED (pollHandshake()): the new host is proven, so let cfg.json have it.
+    void confirmHostMigration() {
+      if (!hostMigrationPending) return;
+      hostMigrationPending = false;
+      configNeedsWrite = true; // serviced by WLED's loop (wled.cpp), which calls addToConfig()
+      Serial.println(F("glowline: legacy host migration confirmed, saving new host"));
+    }
+
     void pollHandshake() {
       while (client.available()) {
         String line = client.readStringUntil('\n');
@@ -424,6 +440,7 @@ class GlowlineUsermod : public Usermod {
             return;
           }
           setState(WsState::CONNECTED);
+          confirmHostMigration();
           backoffMs = BACKOFF_MIN_MS; // reset backoff after a successful connect
           lastInboundAt = millis();
           lastPingSentAt = millis();
@@ -1442,8 +1459,16 @@ class GlowlineUsermod : public Usermod {
 
     void addToConfig(JsonObject& root) {
       JsonObject top = root.createNestedObject(F("glowline"));
-      top[F("host")] = wsHost;
-      top[F("port")] = wsPort;
+#ifdef LUMEN_LEGACY_HOST
+      if (hostMigrationPending) { // not yet proven -- keep the legacy host on disk (see LUMEN_LEGACY_HOST)
+        top[F("host")] = String(F(LUMEN_LEGACY_HOST));
+        top[F("port")] = legacyPort;
+      } else
+#endif
+      {
+        top[F("host")] = wsHost;
+        top[F("port")] = wsPort;
+      }
       top[F("deviceId")] = wsDeviceId;
       top[F("token")] = wsToken;
     }
@@ -1461,6 +1486,17 @@ class GlowlineUsermod : public Usermod {
       // default would never reach them. A saved host with port 0 gets the default port so a
       // half-configured board never dials port 0.
       bool appliedDefault = false;
+      hostMigrationPending = false;
+#ifdef LUMEN_LEGACY_HOST
+      // Exact, case-sensitive match (String::equals); persisted only by confirmHostMigration().
+      if (strlen(LUMEN_DEVICE_HOST) > 0 && wsHost.equals(F(LUMEN_LEGACY_HOST))) {
+        legacyPort = wsPort;
+        wsHost = F(LUMEN_DEVICE_HOST);
+        wsPort = LUMEN_DEVICE_PORT;
+        hostMigrationPending = true;
+        appliedDefault = true;
+      } else
+#endif
       if (wsHost.length() == 0 && strlen(LUMEN_DEVICE_HOST) > 0) {
         wsHost = F(LUMEN_DEVICE_HOST);
         wsPort = LUMEN_DEVICE_PORT;
