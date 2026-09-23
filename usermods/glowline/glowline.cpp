@@ -47,6 +47,18 @@
 #define GLOWLINE_CUE_MAX_LEDS 65535
 #endif
 
+// Build-time default backend for boards whose saved host is empty (never set up, or cleared in
+// Settings -> Usermods) -- applied in readFromConfig(), below. A saved non-empty host is never
+// replaced, so existing boards keep whatever they're configured with. Set per env in
+// platformio_override.ini, e.g. -D LUMEN_DEVICE_HOST=\"devices.buylumen.com\"; the empty default
+// keeps the old behavior (no connection until a host is entered by hand).
+#ifndef LUMEN_DEVICE_HOST
+#define LUMEN_DEVICE_HOST ""
+#endif
+#ifndef LUMEN_DEVICE_PORT
+#define LUMEN_DEVICE_PORT 443
+#endif
+
 // GLOWLINE_OTA_TEST_FORCE_BAD_HOST (readFromConfig(), below) permanently breaks this build's
 // ability to ever reach the backend -- it must never be paired with the real 15-minute rollback
 // timeout, or a mistake here means a device that can't be recovered without a USB cable for 15
@@ -1387,7 +1399,10 @@ class GlowlineUsermod : public Usermod {
         finishSuccessSignal();
       }
 
-      if (wsHost.length() == 0 || wsPort == 0) return; // not configured yet
+      // Not configured yet. Credentials are checked too: with a build-default host, an unprovisioned
+      // board would otherwise dial the backend with an empty device/token, get a 400, and retry
+      // forever. Clearing the token is also how a board is taken offline on purpose.
+      if (wsHost.length() == 0 || wsPort == 0 || wsDeviceId.length() == 0 || wsToken.length() == 0) return;
 
       if (!WLED_CONNECTED) {
         if (wsState == WsState::CONNECTED || wsState == WsState::CONNECTING) onDisconnected(F("WiFi lost"));
@@ -1440,6 +1455,26 @@ class GlowlineUsermod : public Usermod {
       configComplete &= getJsonValue(top[F("port")], wsPort, (uint16_t)0);
       configComplete &= getJsonValue(top[F("deviceId")], wsDeviceId, String(""));
       configComplete &= getJsonValue(top[F("token")], wsToken, String(""));
+
+      // Build defaults (see LUMEN_DEVICE_HOST). An empty host counts as "not set" -- older
+      // firmware already wrote host="" into cfg.json on never-set-up boards, so a missing-key-only
+      // default would never reach them. A saved host with port 0 gets the default port so a
+      // half-configured board never dials port 0.
+      bool appliedDefault = false;
+      if (wsHost.length() == 0 && strlen(LUMEN_DEVICE_HOST) > 0) {
+        wsHost = F(LUMEN_DEVICE_HOST);
+        wsPort = LUMEN_DEVICE_PORT;
+        appliedDefault = true;
+      } else if (wsHost.length() > 0 && wsPort == 0) {
+        wsPort = LUMEN_DEVICE_PORT;
+        appliedDefault = true;
+      }
+      if (appliedDefault) {
+        Serial.print(F("glowline: applied build default host/port -> "));
+        Serial.print(wsHost);
+        Serial.print(':');
+        Serial.println(wsPort);
+      }
 
 #ifdef GLOWLINE_OTA_TEST_FORCE_BAD_HOST
       // OTA rollback bench-testing only: ignore whatever host is actually saved in Settings ->
