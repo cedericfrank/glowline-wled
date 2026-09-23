@@ -36,9 +36,11 @@ Update `docs/PROGRESS.md` at every GATE and whenever the session ends (keep it u
 
 ```bash
 npm ci && npm run build                          # web UI headers; required before any pio build
-pio run -e esp32s3_glowline_pioarduino           # always pass -e explicitly
+pio run -e esp32s3_lumen_prod                    # release env; esp32s3_lumen_dev for the dev Worker
 ```
 
-Firmware version is set per build: `-D GLOWLINE_FW_VERSION=\"x.y.z\"`.
+Always pass `-e` explicitly. Firmware version is set per build via
+`PLATFORMIO_BUILD_FLAGS='-D GLOWLINE_FW_VERSION=\"x.y.z\"'` (changing it wipes `.pio/build`).
+Signing: `usermods/glowline/readme.md` ("Signing a release (macOS)").
 Envs containing `BENCH` / `DO_NOT_SHIP`, and the `GLOWLINE_OTA_TEST_FORCE_BAD_HOST` flag, are for
 bench rollback tests only; never ship their output.
