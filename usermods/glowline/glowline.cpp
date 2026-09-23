@@ -82,6 +82,16 @@
 #ifdef GLOWLINE_BENCH_FORCE_DEFAULT_HOST
 static_assert(sizeof(LUMEN_DEVICE_HOST) > 1, "GLOWLINE_BENCH_FORCE_DEFAULT_HOST needs a non-empty LUMEN_DEVICE_HOST");
 #endif
+// GLOWLINE_OTA_TEST_FORCE_BAD_HOST images are dev-based: the prod env's legacy-host migration has its
+// own write-back rule in addToConfig() and must not be mixed with a forced host.
+#if defined(GLOWLINE_OTA_TEST_FORCE_BAD_HOST) && defined(LUMEN_LEGACY_HOST)
+#error "GLOWLINE_OTA_TEST_FORCE_BAD_HOST is for dev-based bench envs only -- never combine it with the prod env's LUMEN_LEGACY_HOST."
+#endif
+// Either bench host override replaces wsHost in memory only; addToConfig() then writes back what
+// cfg.json actually holds, so no config save can persist the forced host.
+#if defined(GLOWLINE_BENCH_FORCE_DEFAULT_HOST) || defined(GLOWLINE_OTA_TEST_FORCE_BAD_HOST)
+#define GLOWLINE_BENCH_HOST_OVERRIDE
+#endif
 
 // Hardware finding: after a real OTA update, esp_ota_get_state_partition() read back VALID, not
 // PENDING_VERIFY, at the top of setup() -- before any of this usermod's own code had run. Traced
@@ -180,8 +190,8 @@ class GlowlineUsermod : public Usermod {
     // cfg.json must keep the legacy one; legacyPort is the port saved alongside it.
     bool hostMigrationPending = false;
     uint16_t legacyPort = 0;
-#ifdef GLOWLINE_BENCH_FORCE_DEFAULT_HOST
-    // What cfg.json actually holds while the bench force is active -- addToConfig() writes these back.
+#ifdef GLOWLINE_BENCH_HOST_OVERRIDE
+    // What cfg.json actually holds while a bench host override is active -- addToConfig() writes these back.
     String benchSavedHost = "";
     uint16_t benchSavedPort = 0;
 #endif
@@ -1295,6 +1305,7 @@ class GlowlineUsermod : public Usermod {
       Serial.println(F("################################################################"));
       Serial.println(F("# glowline: OTA TEST BUILD -- wsHost is FORCED to example.com   #"));
       Serial.println(F("# This build can NEVER complete a real WebSocket connection.    #"));
+      Serial.println(F("# The saved host in cfg.json is ignored but never overwritten.  #"));
       Serial.println(F("# DO NOT SHIP THIS BUILD TO A REAL UNIT"));
       Serial.println(F("################################################################"));
 #endif
@@ -1486,7 +1497,7 @@ class GlowlineUsermod : public Usermod {
 
     void addToConfig(JsonObject& root) {
       JsonObject top = root.createNestedObject(F("glowline"));
-#if defined(GLOWLINE_BENCH_FORCE_DEFAULT_HOST)
+#ifdef GLOWLINE_BENCH_HOST_OVERRIDE
       top[F("host")] = benchSavedHost; // never the forced host
       top[F("port")] = benchSavedPort;
 #else
@@ -1512,7 +1523,7 @@ class GlowlineUsermod : public Usermod {
       configComplete &= getJsonValue(top[F("port")], wsPort, (uint16_t)0);
       configComplete &= getJsonValue(top[F("deviceId")], wsDeviceId, String(""));
       configComplete &= getJsonValue(top[F("token")], wsToken, String(""));
-#ifdef GLOWLINE_BENCH_FORCE_DEFAULT_HOST
+#ifdef GLOWLINE_BENCH_HOST_OVERRIDE
       benchSavedHost = wsHost;
       benchSavedPort = wsPort;
 #endif
@@ -1565,6 +1576,8 @@ class GlowlineUsermod : public Usermod {
       // completes a TLS handshake, so beginConnect() gets past DNS/TCP/TLS, but it isn't a
       // WebSocket server, so pollHandshake() never sees a 101 and CONNECTED never fires --
       // mark-valid never runs, and the rollback timeout in loop() eventually fires for real.
+      // In memory only: addToConfig() writes back the saved host (GLOWLINE_BENCH_HOST_OVERRIDE), so
+      // a config save during the test can't leave the rolled-back image dialing example.com.
       // NEVER define this flag in a build meant to run for real.
       wsHost = "example.com";
       wsPort = 443;
