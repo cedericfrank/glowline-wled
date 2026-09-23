@@ -1451,6 +1451,8 @@ class GlowlineUsermod : public Usermod {
     }
 
     void appendConfigData() {
+      // section heading is the cfg.json key ("glowline", kept so saved config isn't orphaned) -- show the product name instead
+      oappend(F("d.querySelectorAll('#um h3').forEach(h=>{if(h.textContent==='glowline')h.textContent='Lumen';});"));
       oappend(F("addInfo('glowline:host',1,'WebSocket server hostname or IP (wss://, TLS but not certificate-verified)');"));
       oappend(F("addInfo('glowline:port',1,'WebSocket server port (443 for a deployed Worker)');"));
       oappend(F("addInfo('glowline:deviceId',1,'Device ID sent as a query param on /ws');"));
