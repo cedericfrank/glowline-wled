@@ -91,6 +91,36 @@ again in the future:
 pio run -e esp32s3_glowline_pioarduino -t upload
 ```
 
+Releases are built from the Lumen envs, which extend the S3 env and only add the build-default
+backend host: **`esp32s3_lumen_prod`** (ships) and `esp32s3_lumen_dev` (dev Worker). Envs whose
+name contains `BENCH` / `DO_NOT_SHIP` are bench rollback tests; never ship their output.
+
+## Signing a release (macOS)
+
+1. Build with the release version (it is compiled in and reported as `fw=`):
+
+   ```
+   PLATFORMIO_BUILD_FLAGS='-D GLOWLINE_FW_VERSION=\"x.y.z\"' pio run -e esp32s3_lumen_prod
+   ```
+
+   Changing `PLATFORMIO_BUILD_FLAGS` makes PlatformIO wipe `.pio/build`, so copy each image out
+   before the next build. Take it from `.pio/build/<env>/firmware.bin`, never from
+   `build_output/release/` (WLED copies every build there under a generic name).
+
+2. Copy it to `dist/<env>-<version>/firmware.bin` (`dist/` is gitignored; never commit signed
+   binaries).
+
+3. Sign it. The private key is read by path from `$LUMEN_OTA_KEY_DIR` (absolute path; the key file
+   must be `chmod 600` or stricter); `--keyFile` is a bare filename in that directory:
+
+   ```
+   node tools/sign-release.mjs --bin dist/<env>-<version>/firmware.bin --version x.y.z --keyFile <name>.pem [--keyId primary|spare]
+   ```
+
+   The script checks the new signature against the public key embedded in `glowline.cpp` and
+   writes `manifest.json` (`version`, `size`, `sha256`, `keyId`, `signature`) next to the image.
+   Upload both through the backend's firmware admin page.
+
 ## Provisioning a new unit (current manual process)
 
 This is the full process for taking a freshly flashed chip to "connected and
