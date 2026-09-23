@@ -909,14 +909,14 @@ WLED_GLOBAL JsonDocument *pDoc _INIT(&gDoc);
 #define WLED_CONNECTED (WLEDNetwork.isConnected())
 
 #if defined(GLOWLINE_AP_SSID)
-  // "Glowline-XXXX" where XXXX is the last 4 hex chars (2 bytes) of the MAC --
+  // "Lumen-XXXX" where XXXX is the last 4 hex chars (2 bytes) of the MAC --
   // kept separate from WLED_AP_SSID_UNIQUE/WLED_BRAND below so it doesn't
   // affect the "brand" field used elsewhere (JSON API, About page).
   #define WLED_SET_AP_SSID() do { \
     snprintf_P(\
       apSSID, \
       sizeof(apSSID)-1, \
-      PSTR("Glowline-%s"), \
+      PSTR("Lumen-%s"), \
       escapedMac.c_str()+8 \
     ); \
   } while(0)
