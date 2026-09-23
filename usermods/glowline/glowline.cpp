@@ -72,6 +72,17 @@
 #error "GLOWLINE_OTA_TEST_FORCE_BAD_HOST requires the bench rollback timeout -- build with the *_BENCH_..._DO_NOT_SHIP env (or otherwise override OTA_VERIFY_TIMEOUT_MS), never with the real 15-minute default."
 #endif
 
+// GLOWLINE_BENCH_FORCE_DEFAULT_HOST (bench envs only): dial LUMEN_DEVICE_HOST even when another
+// host is saved -- bench boards keep the old prod host in cfg.json, and a dev-based bench image must
+// never reach prod. In memory only: addToConfig() writes back the host/port that are actually
+// saved, so no config save can persist the forced host. Only allowed with a dev default host.
+#if defined(GLOWLINE_BENCH_FORCE_DEFAULT_HOST) && defined(LUMEN_LEGACY_HOST)
+#error "GLOWLINE_BENCH_FORCE_DEFAULT_HOST is for dev-based bench envs only -- never combine it with the prod env's LUMEN_LEGACY_HOST."
+#endif
+#ifdef GLOWLINE_BENCH_FORCE_DEFAULT_HOST
+static_assert(sizeof(LUMEN_DEVICE_HOST) > 1, "GLOWLINE_BENCH_FORCE_DEFAULT_HOST needs a non-empty LUMEN_DEVICE_HOST");
+#endif
+
 // Hardware finding: after a real OTA update, esp_ota_get_state_partition() read back VALID, not
 // PENDING_VERIFY, at the top of setup() -- before any of this usermod's own code had run. Traced
 // to Arduino-ESP32 core's own initArduino() (esp32-hal-misc.c), which runs before setup() and,
@@ -169,6 +180,11 @@ class GlowlineUsermod : public Usermod {
     // cfg.json must keep the legacy one; legacyPort is the port saved alongside it.
     bool hostMigrationPending = false;
     uint16_t legacyPort = 0;
+#ifdef GLOWLINE_BENCH_FORCE_DEFAULT_HOST
+    // What cfg.json actually holds while the bench force is active -- addToConfig() writes these back.
+    String benchSavedHost = "";
+    uint16_t benchSavedPort = 0;
+#endif
 
     // TLS connection
     WiFiClientSecure client;
@@ -1266,6 +1282,15 @@ class GlowlineUsermod : public Usermod {
       Serial.println(F("################################################################"));
 #endif
 
+#ifdef GLOWLINE_BENCH_FORCE_DEFAULT_HOST
+      Serial.println(F("################################################################"));
+      Serial.print(F("# glowline: BENCH BUILD -- host FORCED (in memory) to "));
+      Serial.println(F(LUMEN_DEVICE_HOST));
+      Serial.println(F("# The saved host in cfg.json is ignored but never overwritten."));
+      Serial.println(F("# DO NOT SHIP THIS BUILD TO A REAL UNIT"));
+      Serial.println(F("################################################################"));
+#endif
+
 #ifdef GLOWLINE_OTA_TEST_FORCE_BAD_HOST
       Serial.println(F("################################################################"));
       Serial.println(F("# glowline: OTA TEST BUILD -- wsHost is FORCED to example.com   #"));
@@ -1461,6 +1486,10 @@ class GlowlineUsermod : public Usermod {
 
     void addToConfig(JsonObject& root) {
       JsonObject top = root.createNestedObject(F("glowline"));
+#if defined(GLOWLINE_BENCH_FORCE_DEFAULT_HOST)
+      top[F("host")] = benchSavedHost; // never the forced host
+      top[F("port")] = benchSavedPort;
+#else
 #ifdef LUMEN_LEGACY_HOST
       if (hostMigrationPending) { // not yet proven -- keep the legacy host on disk (see LUMEN_LEGACY_HOST)
         top[F("host")] = String(F(LUMEN_LEGACY_HOST));
@@ -1471,6 +1500,7 @@ class GlowlineUsermod : public Usermod {
         top[F("host")] = wsHost;
         top[F("port")] = wsPort;
       }
+#endif
       top[F("deviceId")] = wsDeviceId;
       top[F("token")] = wsToken;
     }
@@ -1482,6 +1512,10 @@ class GlowlineUsermod : public Usermod {
       configComplete &= getJsonValue(top[F("port")], wsPort, (uint16_t)0);
       configComplete &= getJsonValue(top[F("deviceId")], wsDeviceId, String(""));
       configComplete &= getJsonValue(top[F("token")], wsToken, String(""));
+#ifdef GLOWLINE_BENCH_FORCE_DEFAULT_HOST
+      benchSavedHost = wsHost;
+      benchSavedPort = wsPort;
+#endif
 
       // Build defaults (see LUMEN_DEVICE_HOST). An empty host counts as "not set" -- older
       // firmware already wrote host="" into cfg.json on never-set-up boards, so a missing-key-only
@@ -1513,6 +1547,15 @@ class GlowlineUsermod : public Usermod {
         Serial.print(':');
         Serial.println(wsPort);
       }
+
+#ifdef GLOWLINE_BENCH_FORCE_DEFAULT_HOST
+      wsHost = F(LUMEN_DEVICE_HOST);
+      wsPort = LUMEN_DEVICE_PORT;
+      Serial.print(F("glowline: BENCH -- host forced (not saved) -> "));
+      Serial.print(wsHost);
+      Serial.print(':');
+      Serial.println(wsPort);
+#endif
 
 #ifdef GLOWLINE_OTA_TEST_FORCE_BAD_HOST
       // OTA rollback bench-testing only: ignore whatever host is actually saved in Settings ->
