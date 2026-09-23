@@ -107,7 +107,7 @@ customer-onboarding flow yet — see Known debt above.
 
 3. **Join the unit's setup AP.** On first boot with no WiFi configured, the
    unit broadcasts its own open (no password) access point named
-   `Glowline-XXXX`, where `XXXX` is the last 4 hex characters of its MAC
+   `Lumen-XXXX`, where `XXXX` is the last 4 hex characters of its MAC
    address. Join that network from your phone.
 
 4. **Enter home WiFi credentials.** WLED's captive portal should open
@@ -116,8 +116,10 @@ customer-onboarding flow yet — see Known debt above.
    unit reboots and joins that network.
 
 5. **Enter the device ID and token.** Find the unit's new IP (router client
-   list, or `http://wled.local` if mDNS resolves) and open its web UI. Go to
-   **Config -> Usermods**, fill in the `glowline` section:
+   list, or `http://lumen-XXXXXX.local` if mDNS resolves, `XXXXXX` = last 6
+   hex characters of the MAC) and open its web UI. Go to
+   **Config -> Usermods**, fill in the **Lumen** section (stored under the
+   `glowline` config key):
    - **Host** — the WebSocket server hostname (the glowline-app Worker)
    - **Port** — `443`
    - **Device Id** — from step 2
