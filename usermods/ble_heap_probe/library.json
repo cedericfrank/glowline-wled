@@ -1,0 +1,5 @@
+{
+  "name": "ble_heap_probe",
+  "build": { "libArchive": false },
+  "dependencies": {}
+}
