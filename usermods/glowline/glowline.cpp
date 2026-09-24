@@ -5,6 +5,7 @@
 #include <Preferences.h>
 #include "esp_log.h"
 #include "esp_ota_ops.h"
+#include "esp_heap_caps.h"
 #include "mbedtls/pk.h"
 #include "mbedtls/md.h"
 #include "mbedtls/sha256.h"
@@ -397,13 +398,27 @@ class GlowlineUsermod : public Usermod {
       c.setCACertBundle(glowlineCrtBundleStart, glowlineCrtBundleEnd - glowlineCrtBundleStart);
     }
 
-    // startTLS() drops the mbedtls error code, so the timing is what tells the two failures apart:
-    // a rejected certificate fails within a few seconds, a stalled handshake runs to the 10s timeout.
-    static void logTlsFailure(const __FlashStringHelper* tag, unsigned long startedAt) {
+    // Runs the TLS handshake (startTLS()) and logs its duration and the lowest internal free heap
+    // reached during it -- the peak cost of a verified handshake, which free heap before/after
+    // can't show. startTLS() drops the mbedtls error code, so on failure the timing is what tells
+    // the two causes apart: a rejected certificate fails within a few seconds, a stalled handshake
+    // runs to the 10s timeout.
+    static bool runTlsHandshake(WiFiClientSecure& c, const __FlashStringHelper* tag) {
+      unsigned long startedAt = millis();
+      bool monitoring = heap_caps_monitor_local_minimum_free_size_start() == ESP_OK;
+      bool ok = c.startTLS();
+      size_t lowWater = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+      if (monitoring) heap_caps_monitor_local_minimum_free_size_stop();
       Serial.print(tag);
-      Serial.print(F(": TLS handshake failed after "));
+      Serial.print(ok ? F(": TLS handshake OK in ") : F(": TLS handshake failed after "));
       Serial.print(millis() - startedAt);
-      Serial.println(F(" ms (certificate not verified, or handshake timeout at 10000 ms)"));
+      Serial.print(F(" ms, lowest internal free heap during it: "));
+      Serial.print(lowWater);
+      if (!monitoring) Serial.print(F(" (since boot)"));
+      Serial.print(F(", largest free block now: "));
+      Serial.println(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+      if (!ok) Serial.println(F("  (certificate not verified, or handshake timeout at 10000 ms)"));
+      return ok;
     }
 
     void beginConnect() {
@@ -439,9 +454,7 @@ class GlowlineUsermod : public Usermod {
       Serial.print(F("glowline ws: tcp connected, starting TLS handshake, free heap: "));
       Serial.println(ESP.getFreeHeap());
 
-      unsigned long tlsStartedAt = millis();
-      if (!client.startTLS()) {
-        logTlsFailure(F("glowline ws"), tlsStartedAt);
+      if (!runTlsHandshake(client, F("glowline ws"))) {
         onDisconnected(F("TLS handshake failed"));
         return;
       }
@@ -878,9 +891,7 @@ class GlowlineUsermod : public Usermod {
         c.setHandshakeTimeout(10);
         c.setPlainStart();
         if (c.connect(host.c_str(), port, 10000)) {
-          unsigned long tlsStartedAt = millis();
-          if (c.startTLS()) return true;
-          logTlsFailure(F("glowline ota"), tlsStartedAt);
+          if (runTlsHandshake(c, F("glowline ota"))) return true;
         }
         Serial.print(F("glowline ota: connect/TLS attempt "));
         Serial.print(attempt + 1);
