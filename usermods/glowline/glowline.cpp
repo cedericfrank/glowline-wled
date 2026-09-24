@@ -16,6 +16,12 @@
   #error "glowline needs a WiFiClientSecure/NetworkClientSecure-capable platform for wss:// -- e.g. pioarduino/platform-espressif32 (see usermods/glowline/platformio_override.ini.sample). The default tasmota-sourced espressif32 platform ships TLS compiled out."
 #endif
 
+// The root CA bundle ESP-IDF builds into libmbedtls (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL,
+// the Mozilla root list) -- the same symbols esp_crt_bundle.c falls back to. Referencing them links
+// the bundle into the image. See useCertBundle().
+extern const uint8_t glowlineCrtBundleStart[] asm("_binary_x509_crt_bundle_start");
+extern const uint8_t glowlineCrtBundleEnd[]   asm("_binary_x509_crt_bundle_end");
+
 // This build's self-reported firmware version -- sent as &fw= on the /ws handshake (docs/OTA.md
 // Section 3) and used as the /ota/check query and the locally-persisted "known bad" marker.
 // Set per release via build_flags, e.g. -D GLOWLINE_FW_VERSION=\"1.2.0\" -- never hand-edit this
@@ -140,10 +146,10 @@ extern "C" bool verifyRollbackLater() {
  *   "setup worked" cue: brief full-brightness green, then solid white at
  *   50%. Lets someone confirm setup succeeded without checking their phone.
  *
- * TLS is via setInsecure() -- the connection is encrypted but the server's
- * certificate is NOT validated (no chain-of-trust check), so this is still
- * vulnerable to a MITM presenting any certificate. That's known debt to
- * replace with setCACert()/a pinned cert before this ships for real.
+ * TLS verifies the server certificate (chain and hostname) against the full
+ * built-in root CA bundle -- see useCertBundle(). Cloudflare issues edge
+ * certificates from several CAs and can switch between them, so nothing is
+ * pinned. Fails closed: a certificate that doesn't verify means no connection.
  *
  * The WebSocket client (handshake + RFC 6455 framing) is otherwise
  * hand-rolled on top of the TCP client rather than using a third-party
@@ -375,6 +381,26 @@ class GlowlineUsermod : public Usermod {
       return out;
     }
 
+    // Every TLS connection this usermod makes (/ws, /ota/check, firmware download) verifies the
+    // server against the built-in root bundle. Must run before connect(): start_ssl_client() sets up
+    // verification there and startTLS() only runs the handshake. With a bundle attached the core
+    // leaves mbedtls at its client default, MBEDTLS_SSL_VERIFY_REQUIRED, and connect(host, ...)
+    // passes the host to mbedtls_ssl_set_hostname(), so both the chain and the name are checked.
+    // esp_crt_bundle_set() only validates and stores the pointer (no allocation), so calling this
+    // per connection is fine. No setInsecure() fallback: a certificate that fails means no connection.
+    static void useCertBundle(WiFiClientSecure& c) {
+      c.setCACertBundle(glowlineCrtBundleStart, glowlineCrtBundleEnd - glowlineCrtBundleStart);
+    }
+
+    // startTLS() drops the mbedtls error code, so the timing is what tells the two failures apart:
+    // a rejected certificate fails within a few seconds, a stalled handshake runs to the 10s timeout.
+    static void logTlsFailure(const __FlashStringHelper* tag, unsigned long startedAt) {
+      Serial.print(tag);
+      Serial.print(F(": TLS handshake failed after "));
+      Serial.print(millis() - startedAt);
+      Serial.println(F(" ms (certificate not verified, or handshake timeout at 10000 ms)"));
+    }
+
     void beginConnect() {
       setState(WsState::CONNECTING);
       Serial.print(F("glowline ws: connecting to "));
@@ -386,11 +412,7 @@ class GlowlineUsermod : public Usermod {
       handshakeStatusLine = "";
       connectStartedAt = millis();
 
-      // TODO(security debt): setInsecure() accepts any certificate the server
-      // presents, with no chain-of-trust check -- encrypted, but still
-      // vulnerable to a MITM. Replace with setCACert() (or a pinned cert)
-      // before this ships for real.
-      client.setInsecure();
+      useCertBundle(client);
       // Bound both blocking calls below explicitly: the library defaults (30s
       // TCP connect, 120s TLS handshake) are far longer than our 60s backoff
       // cap assumes, so a single hung attempt against a network that silently
@@ -412,7 +434,9 @@ class GlowlineUsermod : public Usermod {
       Serial.print(F("glowline ws: tcp connected, starting TLS handshake, free heap: "));
       Serial.println(ESP.getFreeHeap());
 
+      unsigned long tlsStartedAt = millis();
       if (!client.startTLS()) {
+        logTlsFailure(F("glowline ws"), tlsStartedAt);
         onDisconnected(F("TLS handshake failed"));
         return;
       }
@@ -845,11 +869,13 @@ class GlowlineUsermod : public Usermod {
     bool connectHttpsWithRetry(WiFiClientSecure& c, const String& host, uint16_t port) {
       static const unsigned long kDelaysMs[] = {500, 1000, 2000};
       for (int attempt = 0; attempt < 3; attempt++) {
-        c.setInsecure(); // same known debt as the wss connection -- see file header comment
+        useCertBundle(c);
         c.setHandshakeTimeout(10);
         c.setPlainStart();
-        if (c.connect(host.c_str(), port, 10000) && c.startTLS()) {
-          return true;
+        if (c.connect(host.c_str(), port, 10000)) {
+          unsigned long tlsStartedAt = millis();
+          if (c.startTLS()) return true;
+          logTlsFailure(F("glowline ota"), tlsStartedAt);
         }
         Serial.print(F("glowline ota: connect/TLS attempt "));
         Serial.print(attempt + 1);
@@ -1489,10 +1515,10 @@ class GlowlineUsermod : public Usermod {
     void appendConfigData() {
       // section heading is the cfg.json key ("glowline", kept so saved config isn't orphaned) -- show the product name instead
       oappend(F("d.querySelectorAll('#um h3').forEach(h=>{if(h.textContent==='glowline')h.textContent='Lumen';});"));
-      oappend(F("addInfo('glowline:host',1,'WebSocket server hostname or IP (wss://, TLS but not certificate-verified)');"));
+      oappend(F("addInfo('glowline:host',1,'WebSocket server hostname (wss://, certificate verified)');"));
       oappend(F("addInfo('glowline:port',1,'WebSocket server port (443 for a deployed Worker)');"));
       oappend(F("addInfo('glowline:deviceId',1,'Device ID sent as a query param on /ws');"));
-      oappend(F("addInfo('glowline:token',1,'Auth token sent as a query param on /ws (encrypted in transit, but the server cert is not verified)');"));
+      oappend(F("addInfo('glowline:token',1,'Auth token sent as a query param on /ws (encrypted in transit)');"));
     }
 
     void addToConfig(JsonObject& root) {

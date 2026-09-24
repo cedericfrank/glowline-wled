@@ -41,12 +41,16 @@ brightness, etc.
 - Prints a heartbeat, free heap, and WebSocket state to Serial every 5
   seconds — useful when a unit is plugged into a laptop during setup.
 
-## Known debt
+## TLS
 
-TLS is via `setInsecure()` — the connection is encrypted but the server's
-certificate is **not** validated (no chain-of-trust check), so this is still
-vulnerable to a MITM presenting any certificate. Replace with `setCACert()`
-or a pinned cert before this ships beyond hand-provisioned beta units.
+Every TLS connection (`/ws`, `/ota/check`, the firmware download) verifies the
+server certificate, chain and hostname, against the root CA bundle ESP-IDF builds
+into mbedTLS (the full Mozilla list). Nothing is pinned: Cloudflare can switch
+between the CAs it issues edge certificates from. A certificate that doesn't
+verify means no connection (no insecure fallback). The host must be a hostname,
+not an IP address, or the hostname check fails.
+
+## Known debt
 
 Device provisioning (see below) is a manual D1 insert done by hand for each
 unit. There's no self-registration flow yet — a device can't claim its own
