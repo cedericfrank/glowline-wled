@@ -77,6 +77,11 @@ extern const uint8_t glowlineCrtBundleEnd[]   asm("_binary_x509_crt_bundle_end")
 #if defined(GLOWLINE_OTA_TEST_FORCE_BAD_HOST) && (OTA_VERIFY_TIMEOUT_MS == (15UL * 60UL * 1000UL))
 #error "GLOWLINE_OTA_TEST_FORCE_BAD_HOST requires the bench rollback timeout -- build with the *_BENCH_..._DO_NOT_SHIP env (or otherwise override OTA_VERIFY_TIMEOUT_MS), never with the real 15-minute default."
 #endif
+// The host GLOWLINE_OTA_TEST_FORCE_BAD_HOST dials. example.com passes TLS but isn't a WebSocket
+// server (H6); the TLS bench envs set a badssl.com host whose certificate must be rejected.
+#ifndef GLOWLINE_OTA_TEST_BAD_HOST_NAME
+#define GLOWLINE_OTA_TEST_BAD_HOST_NAME "example.com"
+#endif
 
 // GLOWLINE_BENCH_FORCE_DEFAULT_HOST (bench envs only): dial LUMEN_DEVICE_HOST even when another
 // host is saved -- bench boards keep the old prod host in cfg.json, and a dev-based bench image must
@@ -1329,7 +1334,8 @@ class GlowlineUsermod : public Usermod {
 
 #ifdef GLOWLINE_OTA_TEST_FORCE_BAD_HOST
       Serial.println(F("################################################################"));
-      Serial.println(F("# glowline: OTA TEST BUILD -- wsHost is FORCED to example.com   #"));
+      Serial.print(F("# glowline: OTA TEST BUILD -- wsHost is FORCED to "));
+      Serial.println(F(GLOWLINE_OTA_TEST_BAD_HOST_NAME));
       Serial.println(F("# This build can NEVER complete a real WebSocket connection.    #"));
       Serial.println(F("# The saved host in cfg.json is ignored but never overwritten.  #"));
       Serial.println(F("# DO NOT SHIP THIS BUILD TO A REAL UNIT"));
@@ -1604,8 +1610,10 @@ class GlowlineUsermod : public Usermod {
       // mark-valid never runs, and the rollback timeout in loop() eventually fires for real.
       // In memory only: addToConfig() writes back the saved host (GLOWLINE_BENCH_HOST_OVERRIDE), so
       // a config save during the test can't leave the rolled-back image dialing example.com.
+      // With a badssl.com GLOWLINE_OTA_TEST_BAD_HOST_NAME the failure is earlier: the certificate
+      // is rejected, so TLS never completes.
       // NEVER define this flag in a build meant to run for real.
-      wsHost = "example.com";
+      wsHost = F(GLOWLINE_OTA_TEST_BAD_HOST_NAME);
       wsPort = 443;
 #endif
 
