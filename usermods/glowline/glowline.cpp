@@ -198,6 +198,24 @@ class GlowlineUsermod : public Usermod {
     uint16_t wsPort = 0;
     String wsDeviceId = "";
     String wsToken = "";
+    // Token storage: the token lives in NVS (namespace TOKEN_NVS_NS), never in anything WLED serves
+    // over HTTP -- /cfg.json, GET /json/cfg and the Settings page all come from addToConfig(), which
+    // writes TOKEN_MASK instead (WLED's own convention for Wi-Fi passwords). A plaintext token found
+    // in cfg.json (older firmware, or typed into Settings) is moved to NVS by readFromConfig().
+    // tokenPlainOnDisk keeps it in cfg.json until this image is proven (confirmTokenMove()): an
+    // image that rolls back to older firmware must still find the plaintext token there.
+    bool tokenPlainOnDisk = false;
+    bool tokenInNvs = false; // the NVS copy matches wsToken (write verified)
+    static constexpr const char* TOKEN_NVS_NS = "glowline";
+    static constexpr const char* TOKEN_MASK = "********";
+
+    // Local status for GET /json/info (addToJsonInfo()), so the app can say why setup failed.
+    // Written by the Wi-Fi event task (onStaEvent()), read by the web server task.
+    volatile uint8_t staLastReason = 0;          // last STA disconnect reason (wifi_err_reason_t), 0 = none this boot
+    volatile unsigned long staAssociatedAt = 0;  // millis() of the last STA association, 0 = not associated
+    volatile bool staGotIp = false;
+    const char* wsLastError = nullptr;           // machine-readable code of the last /ws failure, nullptr = none
+    int wsLastHttpStatus = 0;                    // status of the last rejected /ws handshake, 0 = none
     // Legacy-host migration (see LUMEN_LEGACY_HOST): true while wsHost holds the new host but
     // cfg.json must keep the legacy one; legacyPort is the port saved alongside it.
     bool hostMigrationPending = false;
@@ -352,7 +370,10 @@ class GlowlineUsermod : public Usermod {
       reconnectDue = true;
     }
 
-    void onDisconnected(const __FlashStringHelper* reason) {
+    // code: machine-readable cause reported in /json/info (see addToJsonInfo()).
+    void onDisconnected(const __FlashStringHelper* reason, const char* code) {
+      wsLastError = code;
+      wsLastHttpStatus = 0;
       client.stop();
       setState(WsState::DISCONNECTED);
       lastBackoffMs = backoffMs;
@@ -447,7 +468,7 @@ class GlowlineUsermod : public Usermod {
       Serial.println(ESP.getFreeHeap());
 
       if (!client.connect(wsHost.c_str(), wsPort, 10000)) { // 10s TCP connect timeout
-        onDisconnected(F("tcp connect failed"));
+        onDisconnected(F("tcp connect failed"), "connect_failed");
         return;
       }
 
@@ -455,7 +476,7 @@ class GlowlineUsermod : public Usermod {
       Serial.println(ESP.getFreeHeap());
 
       if (!runTlsHandshake(client, F("glowline ws"))) {
-        onDisconnected(F("TLS handshake failed"));
+        onDisconnected(F("TLS handshake failed"), "tls_failed");
         return;
       }
 
@@ -493,6 +514,15 @@ class GlowlineUsermod : public Usermod {
       Serial.println(F("glowline: legacy host migration confirmed, saving new host"));
     }
 
+    // Drops the plaintext token from cfg.json once it is safely in NVS and this image can no longer
+    // roll back: from setup() when the image is not pending verify, else at mark-valid (see tokenPlainOnDisk).
+    void confirmTokenMove() {
+      if (!tokenPlainOnDisk || !tokenInNvs) return;
+      tokenPlainOnDisk = false;
+      configNeedsWrite = true; // serviced by WLED's loop (wled.cpp), which calls addToConfig()
+      Serial.println(F("glowline: token stored on the board, removing it from cfg.json"));
+    }
+
     void pollHandshake() {
       while (client.available()) {
         String line = client.readStringUntil('\n');
@@ -504,11 +534,17 @@ class GlowlineUsermod : public Usermod {
           if (handshakeStatusLine.indexOf(F("101")) < 0) {
             Serial.print(F("glowline ws: handshake rejected: "));
             Serial.println(handshakeStatusLine);
-            onDisconnected(F("handshake rejected"));
+            // "HTTP/1.1 401 Unauthorized" -> 401 (0 if the line is malformed)
+            int sp = handshakeStatusLine.indexOf(' ');
+            int status = sp >= 0 ? handshakeStatusLine.substring(sp + 1).toInt() : 0;
+            onDisconnected(F("handshake rejected"), "rejected");
+            wsLastHttpStatus = status; // after onDisconnected(), which clears it
             return;
           }
           setState(WsState::CONNECTED);
           confirmHostMigration();
+          wsLastError = nullptr;
+          wsLastHttpStatus = 0;
           backoffMs = BACKOFF_MIN_MS; // reset backoff after a successful connect
           lastInboundAt = millis();
           lastPingSentAt = millis();
@@ -528,6 +564,7 @@ class GlowlineUsermod : public Usermod {
             esp_ota_mark_app_valid_cancel_rollback();
             otaPendingVerify = false;
             Serial.println(F("glowline ota: image marked valid (WS connected)"));
+            confirmTokenMove();
             // This confirms a different, working image -- whatever local block existed for a
             // previously-failed version no longer applies. See otaKnownBadVersion's own comment
             // for why this is the only place that clears it.
@@ -549,11 +586,11 @@ class GlowlineUsermod : public Usermod {
         if (handshakeStatusLine.length() == 0) handshakeStatusLine = line;
       }
       if (!client.connected()) {
-        onDisconnected(F("closed during handshake"));
+        onDisconnected(F("closed during handshake"), "closed");
         return;
       }
       if (millis() - connectStartedAt > HANDSHAKE_TIMEOUT_MS) {
-        onDisconnected(F("handshake timed out"));
+        onDisconnected(F("handshake timed out"), "timeout");
       }
     }
 
@@ -686,7 +723,7 @@ class GlowlineUsermod : public Usermod {
           break;
         case 0x8: // close
           Serial.println(F("glowline ws: received close frame"));
-          onDisconnected(F("closed by peer"));
+          onDisconnected(F("closed by peer"), "closed");
           break;
         case 0x9: // ping -> reply with pong
           Serial.println(F("glowline ws: received ping"));
@@ -773,7 +810,7 @@ class GlowlineUsermod : public Usermod {
         Serial.print(F("glowline ws: no inbound frame in "));
         Serial.print(LIVENESS_TIMEOUT_MS / 1000);
         Serial.println(F("s, treating connection as dead"));
-        onDisconnected(F("liveness timeout"));
+        onDisconnected(F("liveness timeout"), "timeout");
         return;
       }
       if (now - lastPingSentAt >= PING_INTERVAL_MS) {
@@ -1311,6 +1348,70 @@ class GlowlineUsermod : public Usermod {
       performOtaDownload(version, size, url, sha256);
     }
 
+    // Token storage (see tokenPlainOnDisk). Returns true only if NVS now holds exactly `token`.
+    bool saveTokenToNvs(const String& token) {
+      Preferences prefs;
+      if (!prefs.begin(TOKEN_NVS_NS, false)) return false;
+      if (token.length() == 0) prefs.remove("token");
+      else prefs.putString("token", token);
+      bool ok = prefs.getString("token", "") == token;
+      prefs.end();
+      return ok;
+    }
+
+    String loadTokenFromNvs() {
+      Preferences prefs;
+      if (!prefs.begin(TOKEN_NVS_NS, true)) return String(""); // namespace doesn't exist yet
+      String token = prefs.getString("token", "");
+      prefs.end();
+      return token;
+    }
+
+    // Runs on the Wi-Fi event task. Keeps the cause of the last failed STA attempt for /json/info.
+    void onStaEvent(arduino_event_id_t event, arduino_event_info_t info) {
+      switch (event) {
+        case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+          staAssociatedAt = millis() | 1; // never 0 (0 = not associated)
+          staGotIp = false;
+          staLastReason = 0;
+          break;
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+          staGotIp = true;
+          break;
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+          staAssociatedAt = 0;
+          staGotIp = false;
+          // ASSOC_LEAVE is the board's own WiFi.disconnect() (WLED stops searching while a phone is
+          // on the hotspot, wled.cpp handleConnection()) -- keep the real cause from before it.
+          if (info.wifi_sta_disconnected.reason != WIFI_REASON_ASSOC_LEAVE) staLastReason = info.wifi_sta_disconnected.reason;
+          break;
+        default:
+          break;
+      }
+    }
+
+    // Groups ESP-IDF disconnect reasons (esp_wifi_types_generic.h) into what the app shows.
+    // The raw code goes out too, so the app can refine this without a firmware change.
+    static const char* staReasonName(uint8_t reason) {
+      switch (reason) {
+        case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT: // WPA2 with a wrong password
+        case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        case WIFI_REASON_AUTH_FAIL:              // WPA3/SAE with a wrong password
+        case WIFI_REASON_MIC_FAILURE:
+          return "wrong_password";
+        case WIFI_REASON_NO_AP_FOUND:            // wrong name, out of range, or a 5 GHz-only network
+          return "network_not_found";
+        case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+        case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+          return "unsupported_security";
+        case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD:
+        case WIFI_REASON_BEACON_TIMEOUT:
+          return "weak_signal";
+        default:
+          return "connection_failed";
+      }
+    }
+
   public:
     void setup() {
       // Printed unconditionally, on every boot (including the one right after a rollback) --
@@ -1390,6 +1491,10 @@ class GlowlineUsermod : public Usermod {
         otaBootTime = millis();
         Serial.println(F("glowline ota: running image is PENDING_VERIFY -- awaiting a successful WS connect to confirm"));
       }
+      // readFromConfig() ran before setup() and couldn't know this yet (see tokenPlainOnDisk).
+      if (!otaPendingVerify) confirmTokenMove();
+
+      WiFi.onEvent([this](arduino_event_id_t event, arduino_event_info_t info) { onStaEvent(event, info); });
 
       {
         Preferences prefs;
@@ -1501,7 +1606,7 @@ class GlowlineUsermod : public Usermod {
       if (wsHost.length() == 0 || wsPort == 0 || wsDeviceId.length() == 0 || wsToken.length() == 0) return;
 
       if (!WLED_CONNECTED) {
-        if (wsState == WsState::CONNECTED || wsState == WsState::CONNECTING) onDisconnected(F("WiFi lost"));
+        if (wsState == WsState::CONNECTED || wsState == WsState::CONNECTING) onDisconnected(F("WiFi lost"), "wifi_lost");
         return;
       }
 
@@ -1517,7 +1622,7 @@ class GlowlineUsermod : public Usermod {
       }
 
       if (!client.connected()) {
-        onDisconnected(F("tcp closed"));
+        onDisconnected(F("tcp closed"), "closed");
         return;
       }
 
@@ -1535,7 +1640,47 @@ class GlowlineUsermod : public Usermod {
       oappend(F("addInfo('glowline:host',1,'WebSocket server hostname (wss://, certificate verified)');"));
       oappend(F("addInfo('glowline:port',1,'WebSocket server port (443 for a deployed Worker)');"));
       oappend(F("addInfo('glowline:deviceId',1,'Device ID sent as a query param on /ws');"));
-      oappend(F("addInfo('glowline:token',1,'Auth token sent as a query param on /ws (encrypted in transit)');"));
+      oappend(F("addInfo('glowline:token',1,'Auth token, stored on the board and never shown. Type a new one to replace it; clear the field to remove it.');"));
+    }
+
+    // GET /json/info -> "lumen": who this board is and why it isn't online, for the app's setup flow
+    // (lumen-shared contracts/firmware.md, "SoftAP provisioning"). Never the token.
+    void addToJsonInfo(JsonObject& root) {
+      JsonObject lumen = root.createNestedObject(F("lumen"));
+      lumen[F("fw")] = F(GLOWLINE_FW_VERSION);
+      lumen[F("device")] = wsDeviceId;
+
+      JsonObject wifi = lumen.createNestedObject(F("wifi"));
+      uint8_t reason = staLastReason;
+      unsigned long associatedAt = staAssociatedAt;
+      if (!WLED_WIFI_CONFIGURED) {
+        wifi[F("state")] = F("not_configured");
+      } else {
+        wifi[F("ssid")] = multiWiFi[0].clientSSID;
+        if (WLEDNetwork.isConnected()) {
+          wifi[F("state")] = F("connected");
+        } else if (associatedAt != 0 && !staGotIp && millis() - associatedAt > 10000) {
+          wifi[F("state")] = F("failed"); // joined, but the router gave it no address
+          wifi[F("reason")] = F("no_ip");
+        } else if (reason != 0) {
+          wifi[F("state")] = F("failed"); // the board keeps retrying; this is the last attempt's cause
+          wifi[F("reason")] = staReasonName(reason);
+          wifi[F("code")] = reason;
+        } else {
+          wifi[F("state")] = F("connecting");
+        }
+      }
+
+      JsonObject server = lumen.createNestedObject(F("server"));
+      if (wsHost.length() == 0 || wsPort == 0 || wsDeviceId.length() == 0 || wsToken.length() == 0) {
+        server[F("state")] = F("not_configured");
+      } else if (wsState == WsState::CONNECTED) {
+        server[F("state")] = F("connected");
+      } else {
+        server[F("state")] = wsState == WsState::CONNECTING ? F("connecting") : F("disconnected");
+        if (wsLastError) server[F("error")] = wsLastError;
+        if (wsLastHttpStatus) server[F("http")] = wsLastHttpStatus;
+      }
     }
 
     void addToConfig(JsonObject& root) {
@@ -1556,7 +1701,9 @@ class GlowlineUsermod : public Usermod {
       }
 #endif
       top[F("deviceId")] = wsDeviceId;
-      top[F("token")] = wsToken;
+      // Never the real token once it is safely in NVS (see tokenPlainOnDisk)
+      if (tokenPlainOnDisk) top[F("token")] = wsToken;
+      else top[F("token")] = wsToken.length() > 0 ? TOKEN_MASK : "";
     }
 
     bool readFromConfig(JsonObject& root) {
@@ -1565,7 +1712,22 @@ class GlowlineUsermod : public Usermod {
       configComplete &= getJsonValue(top[F("host")], wsHost, String(""));
       configComplete &= getJsonValue(top[F("port")], wsPort, (uint16_t)0);
       configComplete &= getJsonValue(top[F("deviceId")], wsDeviceId, String(""));
-      configComplete &= getJsonValue(top[F("token")], wsToken, String(""));
+      String cfgToken;
+      configComplete &= getJsonValue(top[F("token")], cfgToken, String(""));
+      if (isAsterisksOnly(cfgToken.c_str(), 65)) {
+        // Unchanged (the mask came back from Settings or a config restore): the token is in NVS.
+        wsToken = loadTokenFromNvs();
+        tokenInNvs = true;
+        tokenPlainOnDisk = false;
+        if (wsToken.length() == 0) Serial.println(F("glowline: cfg.json says a token is stored, but the board has none -- enter it in Settings"));
+      } else {
+        // A new or cleared token, or one saved in plaintext by older firmware: move it to NVS.
+        wsToken = cfgToken;
+        tokenInNvs = saveTokenToNvs(wsToken);
+        if (!tokenInNvs) Serial.println(F("glowline: could not store the token on the board, keeping it in cfg.json"));
+        // At boot, setup() decides once the OTA state is known; later saves know it already.
+        tokenPlainOnDisk = wsToken.length() > 0 && (!hasLoadedConfigOnce || otaPendingVerify || !tokenInNvs);
+      }
 #ifdef GLOWLINE_BENCH_HOST_OVERRIDE
       benchSavedHost = wsHost;
       benchSavedPort = wsPort;

@@ -50,6 +50,42 @@ between the CAs it issues edge certificates from. A certificate that doesn't
 verify means no connection (no insecure fallback). The host must be a hostname,
 not an IP address, or the hostname check fails.
 
+## Token storage
+
+WLED serves its config to anyone on the network, without a login: the file
+`/cfg.json`, `GET /json/cfg` and the Settings page. So the token isn't kept
+there. It is stored in NVS (namespace `glowline`, key `token`), and the config
+only ever shows `********`, the way WLED hides Wi-Fi passwords. Typing a new
+token in **Config -> Usermods** replaces it; clearing the field removes it.
+
+A board upgraded from older firmware still has the plaintext token in
+`cfg.json`. The new image copies it to NVS at boot, but leaves it in `cfg.json`
+until the image has connected once and is marked valid. If the update rolls
+back, the older firmware still finds its token. Downgrading a board by OTA after
+that means entering the token again. A config backup no longer carries the
+token either.
+
+## Local status (`GET /json/info`)
+
+The `lumen` object in `/json/info` tells the setup app who the board is and why
+it isn't online:
+
+```json
+"lumen": {
+  "fw": "1.5.0", "device": "<device ID>",
+  "wifi":   {"state": "failed", "ssid": "Home", "reason": "wrong_password", "code": 15},
+  "server": {"state": "disconnected", "error": "rejected", "http": 401}
+}
+```
+
+`wifi.state` is `not_configured`, `connecting`, `connected` or `failed`.
+`reason` is `wrong_password`, `network_not_found`, `unsupported_security`,
+`weak_signal`, `no_ip` or `connection_failed`; `code` is the raw ESP-IDF reason.
+`server.state` is `not_configured`, `connecting`, `connected` or `disconnected`;
+`error` is `connect_failed`, `tls_failed`, `rejected` (with `http`), `timeout`,
+`closed` or `wifi_lost`. The token never appears here. The full interface is in
+the Lumen firmware contract.
+
 ## Known debt
 
 Device provisioning (see below) is a manual D1 insert done by hand for each
@@ -157,7 +193,7 @@ customer-onboarding flow yet — see Known debt above.
    - **Host** — the WebSocket server hostname (the glowline-app Worker)
    - **Port** — `443`
    - **Device Id** — from step 2
-   - **Token** — from step 2
+   - **Token** — from step 2 (after saving it shows as `********`)
 
    Save. The unit immediately attempts a `wss://` connection using those
    values.
