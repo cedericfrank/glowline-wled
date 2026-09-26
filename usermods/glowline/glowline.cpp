@@ -1392,8 +1392,9 @@ class GlowlineUsermod : public Usermod {
             staRecent[staRecentCount % 4] = reason;
             staRecentCount = staRecentCount + 1;
             // WLED retries a failed join by tearing the driver down (wled.cpp initConnection()), and starting
-            // the hotspot interrupts it too; both end in generic codes. Never let those replace the real cause.
-            if (staReasonIsSpecific(reason) || !staReasonIsSpecific(staLastReason)) staLastReason = reason;
+            // the hotspot interrupts it too; both end in generic codes. Keep the most telling cause since the
+            // last association (staReasonRank()); it resets on the next association or reboot.
+            if (staReasonRank(reason) >= staReasonRank(staLastReason)) staLastReason = reason;
           }
           break;
         default:
@@ -1423,9 +1424,16 @@ class GlowlineUsermod : public Usermod {
       }
     }
 
-    // True for every reason the app gets a specific message for (anything but "connection_failed").
-    static bool staReasonIsSpecific(uint8_t reason) {
-      return strcmp(staReasonName(reason), "connection_failed") != 0;
+    // How far the join got: a later stage outranks an earlier one. A board whose password was rejected
+    // has seen the network, so an occasional scan miss (NO_AP_FOUND between wrong-password codes, seen
+    // on the bench) must not turn it into "network_not_found". Generic codes rank lowest.
+    static uint8_t staReasonRank(uint8_t reason) {
+      const char* name = staReasonName(reason);
+      if (!strcmp(name, "wrong_password"))       return 4;
+      if (!strcmp(name, "unsupported_security")) return 3;
+      if (!strcmp(name, "weak_signal"))          return 2;
+      if (!strcmp(name, "network_not_found"))    return 1;
+      return 0;
     }
 
   public:
