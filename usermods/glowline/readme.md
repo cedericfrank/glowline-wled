@@ -80,7 +80,9 @@ it isn't online:
 
 `wifi.state` is `not_configured`, `connecting`, `connected` or `failed`.
 `reason` is `wrong_password`, `network_not_found`, `unsupported_security`,
-`weak_signal`, `no_ip` or `connection_failed`; `code` is the raw ESP-IDF reason.
+`weak_signal`, `no_ip` or `connection_failed`; `code` is the raw ESP-IDF reason and
+`recent` the last few raw codes. A generic code never replaces a specific one: WLED's
+retries end in generic codes that would otherwise hide the real cause.
 `server.state` is `not_configured`, `connecting`, `connected` or `disconnected`;
 `error` is `connect_failed`, `tls_failed`, `rejected` (with `http`), `timeout`,
 `closed` or `wifi_lost`. The token never appears here. The full interface is in

@@ -211,7 +211,10 @@ class GlowlineUsermod : public Usermod {
 
     // Local status for GET /json/info (addToJsonInfo()), so the app can say why setup failed.
     // Written by the Wi-Fi event task (onStaEvent()), read by the web server task.
-    volatile uint8_t staLastReason = 0;          // last STA disconnect reason (wifi_err_reason_t), 0 = none this boot
+    volatile uint8_t staLastReason = 0;          // most specific STA disconnect reason since the last association (wifi_err_reason_t), 0 = none
+    volatile uint8_t staRecent[4] = {0};         // last raw disconnect reasons, ring buffer (ASSOC_LEAVE excluded)
+    volatile uint8_t staRecentCount = 0;         // total recorded, wraps; staRecent[(staRecentCount - 1) % 4] is the newest
+    uint8_t staLoggedCount = 0;                  // how many of them loop() has printed
     volatile unsigned long staAssociatedAt = 0;  // millis() of the last STA association, 0 = not associated
     volatile bool staGotIp = false;
     const char* wsLastError = nullptr;           // machine-readable code of the last /ws failure, nullptr = none
@@ -1383,7 +1386,15 @@ class GlowlineUsermod : public Usermod {
           staGotIp = false;
           // ASSOC_LEAVE is the board's own WiFi.disconnect() (WLED stops searching while a phone is
           // on the hotspot, wled.cpp handleConnection()) -- keep the real cause from before it.
-          if (info.wifi_sta_disconnected.reason != WIFI_REASON_ASSOC_LEAVE) staLastReason = info.wifi_sta_disconnected.reason;
+          {
+            uint8_t reason = info.wifi_sta_disconnected.reason ? info.wifi_sta_disconnected.reason : (uint8_t)WIFI_REASON_UNSPECIFIED;
+            if (reason == WIFI_REASON_ASSOC_LEAVE) break;
+            staRecent[staRecentCount % 4] = reason;
+            staRecentCount = staRecentCount + 1;
+            // WLED retries a failed join by tearing the driver down (wled.cpp initConnection()), and starting
+            // the hotspot interrupts it too; both end in generic codes. Never let those replace the real cause.
+            if (staReasonIsSpecific(reason) || !staReasonIsSpecific(staLastReason)) staLastReason = reason;
+          }
           break;
         default:
           break;
@@ -1410,6 +1421,11 @@ class GlowlineUsermod : public Usermod {
         default:
           return "connection_failed";
       }
+    }
+
+    // True for every reason the app gets a specific message for (anything but "connection_failed").
+    static bool staReasonIsSpecific(uint8_t reason) {
+      return strcmp(staReasonName(reason), "connection_failed") != 0;
     }
 
   public:
@@ -1556,6 +1572,13 @@ class GlowlineUsermod : public Usermod {
     }
 
     void loop() {
+      // Wi-Fi disconnect reasons are recorded on the event task (onStaEvent()); print them from here.
+      if ((uint8_t)(staRecentCount - staLoggedCount) > 4) staLoggedCount = staRecentCount - 4; // older ones were overwritten
+      while (staLoggedCount != staRecentCount) {
+        uint8_t reason = staRecent[staLoggedCount % 4];
+        staLoggedCount++;
+        Serial.printf("glowline wifi: disconnected, reason %u (%s)\n", reason, staReasonName(reason));
+      }
       advanceBootCue();
 
       // Rollback timeout: unaffected by anything else in loop() being blocked (the OTA
@@ -1666,6 +1689,9 @@ class GlowlineUsermod : public Usermod {
           wifi[F("state")] = F("failed"); // the board keeps retrying; this is the last attempt's cause
           wifi[F("reason")] = staReasonName(reason);
           wifi[F("code")] = reason;
+          JsonArray recent = wifi.createNestedArray(F("recent")); // raw codes, oldest first
+          uint8_t count = staRecentCount;
+          for (uint8_t i = count > 4 ? count - 4 : 0; i != count; i++) recent.add(staRecent[i % 4]);
         } else {
           wifi[F("state")] = F("connecting");
         }
