@@ -82,6 +82,11 @@ At every GATE and at the END of every session (unchanged from PLAN.md):
   maintainer copies those into the runbook. PROGRESS.md is the record; at gates,
   chat gets the PROGRESS.md diff and whatever the GATE checklist in PLAN.md asks
   for, nothing more.
+- Before replacing the "For the runbook" block in `docs/PROGRESS.md`, check
+  `~/dev/lumen-shared/RUNBOOK.md` and carry over any old bullet it doesn't cover
+  yet. Match on identifiers (commit hash, deploy version, gate name, REQ number,
+  release version), not wording, because the runbook paraphrases. Drop a bullet
+  once its identifiers appear there.
 - Move requests you completed to `lumen-shared/requests/done/` and update
   the Status column of the contract file if an interface shipped.
 - Put under **"Needs the maintainer"** only what a session cannot decide.
