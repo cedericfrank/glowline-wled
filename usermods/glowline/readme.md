@@ -6,7 +6,7 @@ brightness, etc.
 
 ## What it does
 
-- Connects to `wss://<host>:<port>/ws?device=<deviceId>&token=<token>&fw=<version>&caps=heartbeat,probe,ack`.
+- Connects to `wss://<host>:<port>/ws?device=<deviceId>&token=<token>&fw=<version>&caps=heartbeat,probe,ack,rotate`.
   Host, port, device ID and token are all configured at runtime via
   **Settings -> Usermods** — nothing is hardcoded or baked into the build.
   `caps` advertises the delivery-ack protocol capabilities this build
@@ -64,6 +64,16 @@ until the image has connected once and is marked valid. If the update rolls
 back, the older firmware still finds its token. Downgrading a board by OTA after
 that means entering the token again. A config backup no longer carries the
 token either.
+
+The server can also replace the token over the WebSocket (`rotate_token`,
+advertised as `rotate` in `caps`). The new token goes to NVS only and is
+acknowledged with `token_rotated` after it has been read back; the current
+connection stays up and the next one uses the new token. Frames carrying a
+token are not echoed to the serial log.
+
+A config post that doesn't include a `glowline` object (for example one made
+for another usermod) leaves these settings and the token untouched. Inside a
+`glowline` object, a key that is left out keeps its value.
 
 ## Local status (`GET /json/info`)
 
