@@ -1195,6 +1195,14 @@ class GlowlineUsermod : public Usermod {
         return;
       }
 
+      // Pause the other usermods the way WLED's own OTA does (wled00/ota_update.cpp:239):
+      // audioreactive suspends its FFT task and closes its UDP socket before flash is written. A
+      // successful update reboots below; every failure return resumes them (destructor).
+      struct UsermodUpdatePause {
+        UsermodUpdatePause()  { UsermodManager::onUpdateBegin(true); }
+        ~UsermodUpdatePause() { UsermodManager::onUpdateBegin(false); }
+      } usermodPause;
+
       if (!Update.begin((size_t)contentLength)) {
         client.stop();
         recordOtaFailure(F("download: Update.begin() failed (not enough free space?)"));
