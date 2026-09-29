@@ -6,7 +6,7 @@ brightness, etc.
 
 ## What it does
 
-- Connects to `wss://<host>:<port>/ws?device=<deviceId>&token=<token>&fw=<version>&caps=heartbeat,probe,ack,rotate`.
+- Connects to `wss://<host>:<port>/ws?device=<deviceId>&token=<token>&fw=<version>&caps=heartbeat,probe,ack,rotate,state`.
   Host, port, device ID and token are all configured at runtime via
   **Settings -> Usermods** — nothing is hardcoded or baked into the build.
   `caps` advertises the delivery-ack protocol capabilities this build
@@ -74,6 +74,24 @@ token are not echoed to the serial log.
 A config post that doesn't include a `glowline` object (for example one made
 for another usermod) leaves these settings and the token untouched. Inside a
 `glowline` object, a key that is left out keeps its value.
+
+## Local state reports
+
+When the strip changes for any reason other than a server push (the owner's
+app on the local network, WLED's own UI, a button), the usermod sends
+`{"type":"state","on","bri","fx","pal","col"}` over the WebSocket: `on` and
+`bri` as WLED's JSON API shows them, `fx`, `pal` and the first color of
+segment 0. It waits for the change to settle (250 ms), sends at most one
+report every 2 seconds, and the last state wins. Audio sync changes none of
+these, so music mode sends nothing.
+
+## Audio sync (Lumen builds)
+
+The `esp32s3_lumen_*` envs build audioreactive enabled as a network-only
+receiver (no mic on the board) on UDP port 11988, with the dynamics limiter
+off. These are build defaults; a board with saved AudioReactive settings
+keeps them. While a pull OTA writes flash, other usermods are paused the way
+WLED's own OTA does it.
 
 ## Local status (`GET /json/info`)
 
