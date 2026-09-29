@@ -1433,6 +1433,8 @@ class GlowlineUsermod : public Usermod {
         "{\"type\":\"state\",\"on\":%s,\"bri\":%u,\"fx\":%u,\"pal\":%u,\"col\":[%u,%u,%u]}",
         now.on ? "true" : "false", now.bri, now.fx, now.pal, now.r, now.g, now.b);
       sendFrame(0x1, (const uint8_t*)msg, (size_t)n);
+      Serial.print(F("glowline ws: sent state report: "));
+      Serial.println(msg);
       stateBaseline = now;
       stateDirty = false;
       stateReportedOnce = true;
