@@ -1742,14 +1742,24 @@ class GlowlineUsermod : public Usermod {
 
     bool readFromConfig(JsonObject& root) {
       JsonObject top = root[F("glowline")];
+      // WLED hands the whole "um" object to every usermod (cfg.cpp:770-773), so a POST /json/cfg
+      // meant for another usermod arrives here without "glowline". That is not a request to clear
+      // anything: keep every setting, the NVS token and the connection as they are.
+      if (top.isNull() && hasLoadedConfigOnce) return false;
+      // A key that is left out keeps its current value (2-arg getJsonValue, fcn_declare.h:53); only
+      // an explicit value, e.g. token "", changes a setting. At boot the members still hold "" / 0.
       bool configComplete = !top.isNull();
-      configComplete &= getJsonValue(top[F("host")], wsHost, String(""));
-      configComplete &= getJsonValue(top[F("port")], wsPort, (uint16_t)0);
-      configComplete &= getJsonValue(top[F("deviceId")], wsDeviceId, String(""));
+      configComplete &= getJsonValue(top[F("host")], wsHost);
+      configComplete &= getJsonValue(top[F("port")], wsPort);
+      configComplete &= getJsonValue(top[F("deviceId")], wsDeviceId);
       String cfgToken;
-      configComplete &= getJsonValue(top[F("token")], cfgToken, String(""));
-      if (isAsterisksOnly(cfgToken.c_str(), 65)) {
-        // Unchanged (the mask came back from Settings or a config restore): the token is in NVS.
+      bool hasToken = getJsonValue(top[F("token")], cfgToken);
+      configComplete &= hasToken;
+      if (!hasToken && hasLoadedConfigOnce) {
+        // Left out of a live save: wsToken, NVS and tokenPlainOnDisk stay as they are.
+      } else if (!hasToken || isAsterisksOnly(cfgToken.c_str(), 65)) {
+        // Left out at boot (cfg.json without the key), or unchanged: the token is in NVS.
+        // (The mask came back from Settings or a config restore.)
         wsToken = loadTokenFromNvs();
         tokenInNvs = true;
         tokenPlainOnDisk = false;
