@@ -492,7 +492,7 @@ class GlowlineUsermod : public Usermod {
       client.print(urlEncode(wsToken));
       client.print(F("&fw="));
       client.print(urlEncode(String(F(GLOWLINE_FW_VERSION))));
-      client.print(F("&caps=heartbeat,probe,ack"));
+      client.print(F("&caps=heartbeat,probe,ack,rotate"));
       client.print(F(" HTTP/1.1\r\n"));
       client.print(F("Host: "));
       client.print(wsHost);
@@ -692,6 +692,14 @@ class GlowlineUsermod : public Usermod {
         return;
       }
 
+      if (type && strcmp(type, "rotate_token") == 0) {
+        String id = sanitizeForJsonString(String((const char*)(root["id"] | "")));
+        String newToken = String((const char*)(root["token"] | ""));
+        releaseJSONBufferLock();
+        handleRotateToken(id, newToken);
+        return;
+      }
+
       if (root.containsKey("v") && root.containsKey("id") && root.containsKey("state")) {
         String id = sanitizeForJsonString(String((const char*)(root["id"] | "")));
         JsonObject state = root["state"];
@@ -719,7 +727,8 @@ class GlowlineUsermod : public Usermod {
         case 0x1: // text
         case 0x0: // continuation (treated as text here)
           Serial.print(F("glowline ws: received: "));
-          Serial.write(frameBuf, len);
+          if (frameMentionsToken(frameBuf, len)) Serial.print(F("[frame with a token, not shown]"));
+          else Serial.write(frameBuf, len);
           if (payloadIdx > MAX_FRAME_PAYLOAD) Serial.print(F(" ...[truncated]"));
           Serial.println();
           handleTextFrame(frameBuf, len);
@@ -1360,6 +1369,62 @@ class GlowlineUsermod : public Usermod {
       bool ok = prefs.getString("token", "") == token;
       prefs.end();
       return ok;
+    }
+
+    // Any inbound frame containing "token" (rotate_token today) is kept out of the serial log.
+    static bool frameMentionsToken(const uint8_t* buf, size_t len) {
+      static const char kNeedle[] = "token";
+      const size_t n = sizeof(kNeedle) - 1;
+      for (size_t i = 0; i + n <= len; i++) {
+        if (memcmp(buf + i, kNeedle, n) == 0) return true;
+      }
+      return false;
+    }
+
+    // Printable ASCII without spaces, 1-128 chars, and not the Settings mask (TOKEN_MASK).
+    static bool isUsableToken(const String& token) {
+      if (token.length() == 0 || token.length() > 128) return false;
+      for (size_t i = 0; i < token.length(); i++) {
+        char c = token[i];
+        if (c < 0x21 || c > 0x7E) return false;
+      }
+      return !isAsterisksOnly(token.c_str(), 129);
+    }
+
+    // rotate_token (REQ-021; contracts/firmware.md): the server replaces this board's token over the
+    // certificate-verified socket. The new token goes to NVS only -- never cfg.json, never serial,
+    // never echoed. The current connection stays up; /ota/check and the next /ws connect use the new
+    // token. The server accepts both tokens until the board connects with the new one, so a crash
+    // or power cut between the save and the ack is harmless, and a resend of the same token is
+    // acked again.
+    void handleRotateToken(const String& id, const String& newToken) {
+      const char* reason = nullptr;
+      if (otaPendingVerify) {
+        // Can't happen while connected (mark-valid runs on 101), but an image that can still roll
+        // back must keep the token that older firmware reads from cfg.json.
+        reason = "not_ready";
+      } else if (!isUsableToken(newToken)) {
+        reason = "invalid_token";
+      } else if (newToken != wsToken || !tokenInNvs) {
+        if (saveTokenToNvs(newToken)) {
+          wsToken = newToken;
+          tokenInNvs = true;
+          if (tokenPlainOnDisk) {
+            tokenPlainOnDisk = false;
+            configNeedsWrite = true; // replace the old plaintext token in cfg.json with the mask
+          }
+        } else {
+          // The NVS copy is now unknown: put the current token back so a reboot still connects.
+          tokenInNvs = saveTokenToNvs(wsToken);
+          reason = "save_failed";
+        }
+      }
+      String msg = reason
+        ? String("{\"type\":\"token_rejected\",\"id\":\"") + id + "\",\"reason\":\"" + reason + "\"}"
+        : String("{\"type\":\"token_rotated\",\"id\":\"") + id + "\"}";
+      sendFrame(0x1, (const uint8_t*)msg.c_str(), msg.length());
+      Serial.print(F("glowline ws: rotate_token -> "));
+      Serial.println(reason ? reason : "saved");
     }
 
     String loadTokenFromNvs() {
