@@ -492,7 +492,7 @@ class GlowlineUsermod : public Usermod {
       client.print(urlEncode(wsToken));
       client.print(F("&fw="));
       client.print(urlEncode(String(F(GLOWLINE_FW_VERSION))));
-      client.print(F("&caps=heartbeat,probe,ack,rotate"));
+      client.print(F("&caps=heartbeat,probe,ack,rotate,state"));
       client.print(F(" HTTP/1.1\r\n"));
       client.print(F("Host: "));
       client.print(wsHost);
@@ -704,8 +704,10 @@ class GlowlineUsermod : public Usermod {
         String id = sanitizeForJsonString(String((const char*)(root["id"] | "")));
         JsonObject state = root["state"];
         bool stateMissing = state.isNull();
+        StateSnap before = readStateSnap();
         bool ok = !stateMissing && deserializeState(state);
         releaseJSONBufferLock();
+        noteServerPush(before);
         String reason = stateMissing ? "missing state" : "deserializeState failed";
         String msg = ok
           ? String("{\"type\":\"state_applied\",\"id\":\"") + id + "\"}"
@@ -715,8 +717,10 @@ class GlowlineUsermod : public Usermod {
       }
 
       // Legacy fallback: raw un-enveloped state push, same behavior as today.
+      StateSnap before = readStateSnap();
       deserializeState(root);
       releaseJSONBufferLock();
+      noteServerPush(before);
       Serial.println(F("glowline ws: applied to WLED state"));
     }
 
@@ -1379,6 +1383,62 @@ class GlowlineUsermod : public Usermod {
       return ok;
     }
 
+    // Local state reports (REQ-017; contracts/firmware.md "state"). The server knows what it pushed;
+    // stateBaseline is the state it is known to have. Anything else that changes these fields (the
+    // owner's app over the LAN, WLED's UI, a button, this usermod's own cues) is sent as one `state`
+    // message once it has settled, at most once per STATE_REPORT_MIN_MS, last state winning. Audio
+    // sync changes none of these fields, so music mode sends nothing. The baseline survives
+    // reconnects, so a change made while offline is reported after the next connect.
+    struct StateSnap {
+      bool on; uint8_t bri, fx, pal, r, g, b;
+      bool operator==(const StateSnap& o) const {
+        return on == o.on && bri == o.bri && fx == o.fx && pal == o.pal && r == o.r && g == o.g && b == o.b;
+      }
+    };
+    static const unsigned long STATE_REPORT_MIN_MS = 2000;
+    static const unsigned long STATE_SETTLE_MS = 250; // skip the intermediate values of a slider drag
+    StateSnap stateBaseline = {};
+    bool stateBaselineSet = false;
+    bool stateDirty = false;
+    unsigned long stateDirtySince = 0;
+    bool stateReportedOnce = false;
+    unsigned long lastStateReportAt = 0;
+
+    // Same values WLED's JSON API shows (json.cpp:650-651); fx, pal and col from segment 0.
+    static StateSnap readStateSnap() {
+      Segment& seg = strip.getSegment(0);
+      uint32_t c = seg.colors[0];
+      return StateSnap{bri > 0, briLast, seg.mode, seg.palette, R(c), G(c), B(c)};
+    }
+
+    // After a server push: the server now knows the resulting state -- unless a local change was
+    // still waiting to be reported, in which case the next report carries both.
+    void noteServerPush(const StateSnap& before) {
+      if (stateBaselineSet && !(before == stateBaseline)) return;
+      stateBaseline = readStateSnap();
+      stateBaselineSet = true;
+      stateDirty = false;
+    }
+
+    void checkStateReport() {
+      if (successSignalPlaying) return; // report where the cue settles, not its green phase
+      StateSnap now = readStateSnap();
+      if (!stateBaselineSet) { stateBaseline = now; stateBaselineSet = true; return; }
+      if (now == stateBaseline) { stateDirty = false; return; }
+      if (!stateDirty) { stateDirty = true; stateDirtySince = millis(); }
+      if (millis() - stateDirtySince < STATE_SETTLE_MS) return;
+      if (stateReportedOnce && millis() - lastStateReportAt < STATE_REPORT_MIN_MS) return;
+      char msg[112];
+      int n = snprintf(msg, sizeof(msg),
+        "{\"type\":\"state\",\"on\":%s,\"bri\":%u,\"fx\":%u,\"pal\":%u,\"col\":[%u,%u,%u]}",
+        now.on ? "true" : "false", now.bri, now.fx, now.pal, now.r, now.g, now.b);
+      sendFrame(0x1, (const uint8_t*)msg, (size_t)n);
+      stateBaseline = now;
+      stateDirty = false;
+      stateReportedOnce = true;
+      lastStateReportAt = millis();
+    }
+
     // Any inbound frame containing "token" (rotate_token today) is kept out of the serial log.
     static bool frameMentionsToken(const uint8_t* buf, size_t len) {
       static const char kNeedle[] = "token";
@@ -1735,6 +1795,7 @@ class GlowlineUsermod : public Usermod {
       } else if (wsState == WsState::CONNECTED) {
         pollFrames();
         if (wsState == WsState::CONNECTED) checkLiveness(); // pollFrames() may have disconnected us (e.g. a close frame)
+        if (wsState == WsState::CONNECTED) checkStateReport();
       }
     }
 
