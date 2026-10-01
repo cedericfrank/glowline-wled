@@ -192,6 +192,20 @@ class GlowlineUsermod : public Usermod {
     static const unsigned long BOOT_CUE_RED_MS = 5000;
     BootCuePhase bootCuePhase = BootCuePhase::CUE_FILL;
     unsigned long bootCuePhaseStartedAt = 0;
+    bool serverPushedDuringCue = false; // the cue then ends on the pushed state, not the saved view
+
+    // Last view (REQ-030/REQ-032): the strip comes back after a reboot showing its last view, parts
+    // included, before (or without) reaching the server. A plain state frame with top-level
+    // "view":true is the server putting the strip's own view on it; the resulting state (segment
+    // bounds and brightness, not power) is saved to VIEW_FILE, only when it differs from the file.
+    // Power is a separate NVS flag, written only when it changes, so a strip that was off stays
+    // off with the view loaded underneath. Glows, reminders and brightness drags never write.
+    static constexpr const char* VIEW_FILE = "/glowline-view.json";
+    static constexpr const char* POWER_NVS_KEY = "on";
+    static const unsigned long POWER_SETTLE_MS = 2000; // a quick off/on tap writes nothing
+    bool powerSaved = false;      // what NVS holds (false when the key was never written)
+    bool powerPending = false;    // bri > 0 differs from powerSaved, waiting to settle
+    unsigned long powerChangedAt = 0;
 
     // WebSocket config (Settings -> Usermods)
     String wsHost = "";
@@ -708,6 +722,7 @@ class GlowlineUsermod : public Usermod {
         bool ok = !stateMissing && deserializeState(state);
         releaseJSONBufferLock();
         noteServerPush(before);
+        if (bootCuePhase != BootCuePhase::CUE_DONE) serverPushedDuringCue = true;
         String reason = stateMissing ? "missing state" : "deserializeState failed";
         String msg = ok
           ? String("{\"type\":\"state_applied\",\"id\":\"") + id + "\"}"
@@ -716,12 +731,16 @@ class GlowlineUsermod : public Usermod {
         return;
       }
 
-      // Legacy fallback: raw un-enveloped state push, same behavior as today.
+      // Raw un-enveloped state push. "view":true (REQ-032) marks the strip's own view; WLED's
+      // deserializeState() ignores the key.
       StateSnap before = readStateSnap();
+      bool isView = root["view"] | false;
       deserializeState(root);
       releaseJSONBufferLock();
       noteServerPush(before);
+      if (bootCuePhase != BootCuePhase::CUE_DONE) serverPushedDuringCue = true;
       Serial.println(F("glowline ws: applied to WLED state"));
+      if (isView) saveView();
     }
 
     void finishFrame() {
@@ -845,11 +864,105 @@ class GlowlineUsermod : public Usermod {
     // Without this, handleOverlayDraw() simply stops drawing and whatever
     // WLED's own default state was (orange, per beginStrip()) would show
     // through underneath -- exactly what this whole cue exists to avoid.
+    // 1.6.0: ends on the last view (VIEW_FILE) with the saved power flag instead, when there is one;
+    // and leaves the state alone if the server already pushed one while the cue was drawing.
     void finishBootCue() {
       bootCuePhase = BootCuePhase::CUE_DONE;
       Serial.println(F("glowline: boot cue finished"));
+      if (serverPushedDuringCue) {
+        Serial.println(F("glowline view: server pushed during the boot cue, keeping its state"));
+        return;
+      }
+      if (restoreView()) return;
       static const char kOff[] = "{\"on\":false}";
       applyJsonState((const uint8_t*)kOff, strlen(kOff));
+    }
+
+    // Saves the state a "view":true push just applied, without power. Same serializeState() call
+    // WLED uses for a preset with "ib" and "sb" (presets.cpp:245-249), so segments past the last
+    // one are saved as {"stop":0} and removed again on restore.
+    void saveView() {
+      if (!requestJSONBufferLock(JSON_LOCK_UNKNOWN)) {
+        Serial.println(F("glowline view: JSON buffer busy, view not saved"));
+        return;
+      }
+      pDoc->clear();
+      JsonObject root = pDoc->to<JsonObject>();
+      serializeState(root, true, true, true);
+      root.remove("on");
+      String json;
+      serializeJson(root, json);
+      releaseJSONBufferLock();
+
+      File f = WLED_FS.open(VIEW_FILE, "r");
+      bool same = f && f.size() == json.length() && f.readString() == json;
+      if (f) f.close();
+      if (same) {
+        Serial.println(F("glowline view: unchanged, not written"));
+        return;
+      }
+      f = WLED_FS.open(VIEW_FILE, "w");
+      size_t written = f ? f.print(json) : 0;
+      if (f) f.close();
+      if (written != json.length()) {
+        Serial.printf("glowline view: write FAILED (%u of %u bytes), reboot shows the previous view\n", written, json.length());
+        WLED_FS.remove(VIEW_FILE); // a cut-off file would not parse; no file = today's off at boot
+        return;
+      }
+      updateFSInfo();
+      Serial.printf("glowline view: saved %u bytes, %u segments\n", json.length(), strip.getSegmentsNum());
+    }
+
+    // Applies VIEW_FILE with the saved power flag. False when there is no usable file (new board,
+    // older firmware, or a view never pushed), so the caller falls back to off.
+    bool restoreView() {
+      File f = WLED_FS.open(VIEW_FILE, "r");
+      if (!f) {
+        Serial.println(F("glowline view: no saved view, strip off"));
+        return false;
+      }
+      if (!requestJSONBufferLock(JSON_LOCK_UNKNOWN)) {
+        f.close();
+        Serial.println(F("glowline view: JSON buffer busy, saved view not applied"));
+        return false;
+      }
+      DeserializationError error = deserializeJson(*pDoc, f);
+      f.close();
+      JsonObject root = pDoc->as<JsonObject>();
+      if (error || root.isNull()) {
+        releaseJSONBufferLock();
+        Serial.printf("glowline view: saved view unreadable (%s), strip off\n", error.c_str());
+        return false;
+      }
+      root["on"] = powerSaved;
+      deserializeState(root);
+      releaseJSONBufferLock();
+      Serial.printf("glowline view: restored saved view, %u segments, power %s\n",
+                    strip.getSegmentsNum(), powerSaved ? "on" : "off");
+      return true;
+    }
+
+    // Keeps the NVS power flag in step with the strip once the boot cue is over. Brightness is not
+    // power: only bri crossing zero counts, and it must hold for POWER_SETTLE_MS.
+    void trackPower() {
+      if (bootCuePhase != BootCuePhase::CUE_DONE) return;
+      bool on = bri > 0;
+      if (on == powerSaved) { powerPending = false; return; }
+      if (!powerPending) { powerPending = true; powerChangedAt = millis(); return; }
+      if (millis() - powerChangedAt < POWER_SETTLE_MS) return;
+      powerPending = false;
+      Preferences prefs;
+      bool ok = prefs.begin(TOKEN_NVS_NS, false) && prefs.putBool(POWER_NVS_KEY, on) == 1;
+      prefs.end();
+      if (!ok) {
+        // Tried again after the next settle; the flag stays as it was.
+        Serial.println(F("glowline view: power flag NVS write FAILED"));
+        powerChangedAt = millis();
+        powerPending = true;
+        return;
+      }
+      powerSaved = on;
+      Serial.printf("glowline view: power flag saved (%s)\n", on ? "on" : "off");
     }
 
     // Advances the boot cue's phase based on elapsed time and WiFi state.
@@ -1662,6 +1775,14 @@ class GlowlineUsermod : public Usermod {
         otaRollbackReportPending = prefs.getBool("rbPending", false);
         prefs.end();
       }
+      {
+        Preferences prefs;
+        if (prefs.begin(TOKEN_NVS_NS, true)) { // read-only; fails if the namespace doesn't exist yet
+          powerSaved = prefs.getBool(POWER_NVS_KEY, false);
+          prefs.end();
+        }
+      }
+
       if (otaRollbackReportPending && otaKnownBadVersion.length() > 0) {
         Serial.print(F("glowline ota: booted after a rollback from version "));
         Serial.print(otaKnownBadVersion);
@@ -1723,6 +1844,7 @@ class GlowlineUsermod : public Usermod {
         Serial.printf("glowline wifi: disconnected, reason %u (%s)\n", reason, staReasonName(reason));
       }
       advanceBootCue();
+      trackPower();
 
       // Rollback timeout: unaffected by anything else in loop() being blocked (the OTA
       // check/download sequence runs on the OLD, already-confirmed image, before any reboot --

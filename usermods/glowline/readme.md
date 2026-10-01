@@ -85,6 +85,20 @@ segment 0. It waits for the change to settle (250 ms), sends at most one
 report every 2 seconds, and the last state wins. Audio sync changes none of
 these, so music mode sends nothing.
 
+## Last view after a reboot
+
+A state push from the server with a top-level `"view":true` is the strip's
+own view. After applying it, the usermod saves the resulting state (parts,
+effects, colors and brightness, not power) to `/glowline-view.json`, only when
+it differs from what is already there. On/off is kept separately in NVS and
+written only when it changes and holds for 2 seconds. Brightness changes,
+glows and other pushes write nothing.
+
+After any reboot the boot cue ends on that view, lit only if the strip was on
+before, with or without Wi-Fi. Without the file the strip ends off, as before.
+If the server pushes something while the boot cue is still showing, that push
+wins.
+
 ## Audio sync (Lumen builds)
 
 The `esp32s3_lumen_*` envs build audioreactive enabled as a network-only
