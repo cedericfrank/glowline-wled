@@ -71,6 +71,8 @@ At the START of every session, before `docs/PLAN.md` and `docs/PROGRESS.md`:
 While working:
 - Edit only this repo, plus `lumen-shared/requests/` and the contract file
   this repo owns. Never edit RUNBOOK.md, DECISIONS.md, or another repo.
+- lumen-shared: commit, never push. Ceddy pushes after each runbook sync so
+  Dannica's clone stays current.
 - Need something from another repo? Do NOT stop. Copy
   `lumen-shared/requests/_TEMPLATE.md` to `REQ-<nnn>-<slug>.md`, stub or
   mock it here, keep going.
