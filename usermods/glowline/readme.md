@@ -6,7 +6,11 @@ brightness, etc.
 
 ## What it does
 
-- Connects to `wss://<host>:<port>/ws?device=<deviceId>&token=<token>&fw=<version>&caps=heartbeat,probe,ack,rotate,state`.
+- Connects to `wss://<host>:<port>/ws?device=<deviceId>&fw=<version>&caps=heartbeat,probe,ack,rotate,state`
+  with the token in an `Authorization: Bearer <token>` header (from 1.7.0, REQ-025; earlier
+  firmware sent `&token=` in the URL). `/ota/check` sends the same header, and so does the firmware
+  download, but only when the manifest's `url` is on the device host itself (same host and port as
+  `/ws`): the token never goes to another host and never appears in a URL or in the serial log.
   Host, port, device ID and token are all configured at runtime via
   **Settings -> Usermods** — nothing is hardcoded or baked into the build.
   `caps` advertises the delivery-ack protocol capabilities this build

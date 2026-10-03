@@ -133,7 +133,8 @@ extern "C" bool verifyRollbackLater() {
  *
  * - Prints a heartbeat and the current free heap to Serial every 5 seconds.
  * - Maintains a TLS (wss://) WebSocket connection to
- *   wss://host:port/ws?device=<deviceId>&token=<token>, where host, port,
+ *   wss://host:port/ws?device=<deviceId>, token in an "Authorization: Bearer"
+ *   header (REQ-025), where host, port,
  *   deviceId and token are all configurable in Settings -> Usermods (nothing
  *   hardcoded). Sends a hello message on connect, logs every message
  *   received, and reconnects with exponential backoff (1s doubling up to a
@@ -500,19 +501,20 @@ class GlowlineUsermod : public Usermod {
       Serial.print(F("glowline ws: TLS handshake complete, free heap: "));
       Serial.println(ESP.getFreeHeap());
 
-      client.print(F("GET /ws?device="));
-      client.print(urlEncode(wsDeviceId));
-      client.print(F("&token="));
-      client.print(urlEncode(wsToken));
-      client.print(F("&fw="));
-      client.print(urlEncode(String(F(GLOWLINE_FW_VERSION))));
-      client.print(F("&caps=heartbeat,probe,ack,rotate,state"));
+      String target = String("/ws?device=") + urlEncode(wsDeviceId) + "&fw=" + urlEncode(String(F(GLOWLINE_FW_VERSION)))
+                      + "&caps=heartbeat,probe,ack,rotate,state";
+      Serial.print(F("glowline ws: GET "));
+      Serial.print(target);
+      Serial.println(F(" (token in the Authorization header)"));
+      client.print(F("GET "));
+      client.print(target);
       client.print(F(" HTTP/1.1\r\n"));
       client.print(F("Host: "));
       client.print(wsHost);
       client.print(':');
       client.print(wsPort);
       client.print(F("\r\n"));
+      printAuthHeader(client);
       client.print(F("Upgrade: websocket\r\n"));
       client.print(F("Connection: Upgrade\r\n"));
       client.print(F("Sec-WebSocket-Key: "));
@@ -1074,6 +1076,19 @@ class GlowlineUsermod : public Usermod {
     // "Connection: close" so end-of-body is just end-of-stream, no chunked-transfer handling
     // needed for these small, server-controlled responses. `c` is caller-owned -- see
     // connectHttpsWithRetry()'s comment on why this never assumes the shared wss `client` member.
+    // REQ-025: the device token goes in this header, never in a URL. Never logged.
+    void printAuthHeader(WiFiClientSecure& c) {
+      c.print(F("Authorization: Bearer "));
+      c.print(wsToken);
+      c.print(F("\r\n"));
+    }
+
+    // The token is sent only to the board's own device host (the one /ws uses). The manifest's url
+    // may name any https host (see performOtaDownload()), and the token must not go to a third party.
+    bool isDeviceHost(const String& host, uint16_t port) {
+      return port == wsPort && host.equalsIgnoreCase(wsHost);
+    }
+
     bool httpGetSmall(WiFiClientSecure& c, const String& host, uint16_t port, const String& path, int& status, String& body, int& retryAfterSec) {
       status = 0;
       body = "";
@@ -1087,7 +1102,9 @@ class GlowlineUsermod : public Usermod {
       c.print(path);
       c.print(F(" HTTP/1.1\r\nHost: "));
       c.print(host);
-      c.print(F("\r\nConnection: close\r\n\r\n"));
+      c.print(F("\r\n"));
+      if (isDeviceHost(host, port)) printAuthHeader(c);
+      c.print(F("Connection: close\r\n\r\n"));
 
       String statusLine = "";
       bool headersDone = false;
@@ -1263,11 +1280,18 @@ class GlowlineUsermod : public Usermod {
       Serial.print(F("glowline ota: free heap after download TLS connect: "));
       Serial.println(ESP.getFreeHeap());
 
+      bool sendToken = isDeviceHost(host, port);
+      Serial.print(F("glowline ota: download from "));
+      Serial.print(host);
+      Serial.println(sendToken ? F(" (device host: token in the Authorization header)")
+                               : F(" (not the device host: no token sent)"));
       client.print(F("GET "));
       client.print(path);
       client.print(F(" HTTP/1.1\r\nHost: "));
       client.print(host);
-      client.print(F("\r\nConnection: close\r\n\r\n"));
+      client.print(F("\r\n"));
+      if (sendToken) printAuthHeader(client);
+      client.print(F("Connection: close\r\n\r\n"));
 
       String statusLine = "";
       bool headersDone = false;
@@ -1416,7 +1440,10 @@ class GlowlineUsermod : public Usermod {
       Serial.print(F("glowline ota: free heap before /ota/check: "));
       Serial.println(ESP.getFreeHeap());
 
-      String path = String("/ota/check?device=") + urlEncode(wsDeviceId) + "&token=" + urlEncode(wsToken) + "&fw=" + urlEncode(String(F(GLOWLINE_FW_VERSION)));
+      String path = String("/ota/check?device=") + urlEncode(wsDeviceId) + "&fw=" + urlEncode(String(F(GLOWLINE_FW_VERSION)));
+      Serial.print(F("glowline ota: GET "));
+      Serial.print(path);
+      Serial.println(F(" (token in the Authorization header)"));
 
       WiFiClientSecure otaCheckClient;
       int status = 0;
