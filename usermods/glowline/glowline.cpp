@@ -719,14 +719,17 @@ class GlowlineUsermod : public Usermod {
       if (root.containsKey("v") && root.containsKey("id") && root.containsKey("state")) {
         String id = sanitizeForJsonString(String((const char*)(root["id"] | "")));
         JsonObject state = root["state"];
-        bool stateMissing = state.isNull();
+        bool stateMissing = state.isNull() || state.size() == 0; // absent, not an object, or {}
         StateSnap before = readStateSnap();
-        bool ok = !stateMissing && deserializeState(state);
+        // deserializeState() returns whether the caller asked for a full-state reply
+        // (root["v"], wled00/json.cpp:372/537/573), not success, and WLED has no error
+        // signal. So "applied" means handed to WLED (REQ-048).
+        if (!stateMissing) deserializeState(state);
         releaseJSONBufferLock();
         noteServerPush(before);
         if (bootCuePhase != BootCuePhase::CUE_DONE) serverPushedDuringCue = true;
-        String reason = stateMissing ? "missing state" : "deserializeState failed";
-        String msg = ok
+        String reason = "missing state";
+        String msg = !stateMissing
           ? String("{\"type\":\"state_applied\",\"id\":\"") + id + "\"}"
           : String("{\"type\":\"state_rejected\",\"id\":\"") + id + "\",\"reason\":\"" + reason + "\"}";
         sendFrame(0x1, (const uint8_t*)msg.c_str(), msg.length());
