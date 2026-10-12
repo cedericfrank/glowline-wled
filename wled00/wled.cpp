@@ -655,7 +655,9 @@ void WLED::setup()
   #if defined(ARDUINO_ARCH_ESP32) && defined(WLED_DISABLE_BROWNOUT_DET)
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 1); //enable brownout detector
   #endif
+  #ifndef GLOWLINE_OWNS_OTA_VALIDATION // the glowline usermod marks a new image valid only once it reaches its backend
   markOTAvalid();
+  #endif
 }
 
 void WLED::beginStrip()
