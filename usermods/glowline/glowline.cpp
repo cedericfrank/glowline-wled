@@ -31,6 +31,21 @@ extern const uint8_t glowlineCrtBundleEnd[]   asm("_binary_x509_crt_bundle_end")
 #define GLOWLINE_FW_VERSION "0.0.0-dev"
 #endif
 
+// The version as tools/sign-release.mjs finds it in the binary: it signs only if this string, with
+// its NUL, appears exactly once and matches --version (a mismatch makes the server re-offer the
+// image forever). `used` keeps it from the compiler; setup() prints from it, so --gc-sections keeps
+// it too.
+#define GLOWLINE_FW_VERSION_MARKER_PREFIX "GLOWLINE_FW_VERSION="
+__attribute__((used)) static const char glowlineFwVersionMarker[] = GLOWLINE_FW_VERSION_MARKER_PREFIX GLOWLINE_FW_VERSION;
+
+#ifdef LUMEN_DEVICE_HOST
+static constexpr bool glowlineStrEq(const char* a, const char* b) {
+  return *a == *b && (*a == '\0' || glowlineStrEq(a + 1, b + 1));
+}
+static_assert(!glowlineStrEq(GLOWLINE_FW_VERSION, "0.0.0-dev"),
+              "lumen env built without a version: set PLATFORMIO_BUILD_FLAGS='-D GLOWLINE_FW_VERSION=\\\"x.y.z\\\"'");
+#endif
+
 // How long a freshly-flashed image has to prove (via a successful WebSocket CONNECT -- see
 // pollHandshake()) that it can actually reach the backend before the bootloader rolls it back.
 // 15 minutes in any build that ships -- overridden to 2 minutes ONLY by the
@@ -1722,7 +1737,7 @@ class GlowlineUsermod : public Usermod {
       // (-D GLOWLINE_FW_VERSION=\"1.2.0\"); see the readme for the exact command.
       Serial.println(F("================================================================"));
       Serial.print(F("= glowline firmware version: "));
-      Serial.println(F(GLOWLINE_FW_VERSION));
+      Serial.println(glowlineFwVersionMarker + sizeof(GLOWLINE_FW_VERSION_MARKER_PREFIX) - 1);
       Serial.println(F("================================================================"));
 
 #if OTA_VERIFY_TIMEOUT_MS != (15UL * 60UL * 1000UL)

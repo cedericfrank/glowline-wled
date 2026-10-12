@@ -83,6 +83,16 @@ if (bytes.length === 0) fail('--bin is empty');
 // ESP app images start with magic byte 0xE9 (ESP-IDF esp_app_format.h, ESP_IMAGE_HEADER_MAGIC) --
 // cheap guard against signing some unrelated file.
 if (bytes[0] !== 0xe9) fail('--bin does not start with the ESP image magic byte 0xE9; is this really firmware.bin?');
+// The version compiled into the image (glowline.cpp glowlineFwVersionMarker) must be --version: a board
+// reports the compiled one, and the server offers by exact match, so a mismatch is re-offered forever.
+const embeddedVersions = readEmbeddedVersions(bytes);
+if (embeddedVersions.length === 0) {
+  fail('--bin has no GLOWLINE_FW_VERSION= marker (built before the marker existed, or not a glowline build?). Nothing written.');
+}
+if (embeddedVersions.length !== 1 || embeddedVersions[0] !== version) {
+  fail(`--bin was built as ${embeddedVersions.map((v) => `"${v}"`).join(', ')}, but --version is "${version}". ` +
+       'Rebuild with the same GLOWLINE_FW_VERSION, or pass the version the image was built with. Nothing written.');
+}
 const size = bytes.length;
 const sha256 = createHash('sha256').update(bytes).digest('hex');
 
@@ -132,5 +142,18 @@ function readEmbeddedPublicKey(srcPath, constName) {
   const pem = literals.join('').replace(/\\n/g, '\n');
   if (!pem.includes('BEGIN PUBLIC KEY')) fail(`${constName} in ${srcPath} doesn't look like a PEM public key`);
   return pem;
+}
+
+// Every NUL-terminated "GLOWLINE_FW_VERSION=<version>" in the image, as the <version> strings.
+function readEmbeddedVersions(image) {
+  const prefix = Buffer.from('GLOWLINE_FW_VERSION=', 'latin1');
+  const found = [];
+  for (let at = image.indexOf(prefix); at >= 0; at = image.indexOf(prefix, at + 1)) {
+    const start = at + prefix.length;
+    const end = image.indexOf(0, start);
+    if (end < 0 || end - start > 64) continue; // not a C string of version length
+    found.push(image.subarray(start, end).toString('latin1'));
+  }
+  return found;
 }
 // AI: end

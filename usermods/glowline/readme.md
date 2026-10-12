@@ -185,7 +185,8 @@ name contains `BENCH` / `DO_NOT_SHIP` are bench rollback tests; never ship their
 
 ## Signing a release (macOS)
 
-1. Build with the release version (it is compiled in and reported as `fw=`):
+1. Build with the release version (it is compiled in and reported as `fw=`; a lumen env built
+   without it fails with a `static_assert`):
 
    ```
    PLATFORMIO_BUILD_FLAGS='-D GLOWLINE_FW_VERSION=\"x.y.z\"' pio run -e esp32s3_lumen_prod
@@ -205,8 +206,10 @@ name contains `BENCH` / `DO_NOT_SHIP` are bench rollback tests; never ship their
    node tools/sign-release.mjs --bin dist/<env>-<version>/firmware.bin --version x.y.z --keyFile <name>.pem [--keyId primary|spare]
    ```
 
-   The script checks the new signature against the public key embedded in `glowline.cpp` and
-   writes `manifest.json` (`version`, `size`, `sha256`, `keyId`, `signature`) next to the image.
+   The script first checks that the image was built as exactly `--version` (the
+   `GLOWLINE_FW_VERSION=<version>` string in the binary, present once) and refuses otherwise: a
+   board reports the compiled version, so a mismatch would be offered again and again. It then
+   checks the new signature against the public key embedded in `glowline.cpp` and writes `manifest.json` (`version`, `size`, `sha256`, `keyId`, `signature`) next to the image.
    Upload both through the backend's firmware admin page.
 
 ## Provisioning a new unit (current manual process)
