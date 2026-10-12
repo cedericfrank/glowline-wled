@@ -5,23 +5,23 @@ committed here is published. See `AGENTS.md` for WLED coding conventions.
 
 ## Session start
 
-First read the four lumen-shared files listed under "Shared context" below, then `docs/PLAN.md`
-and `docs/PROGRESS.md` (local-only, listed in `.git/info/exclude`, never committed). Requests
-addressed to glowline-wled come before the next unchecked item in `docs/PROGRESS.md`; RUNBOOK.md
-outranks `docs/PLAN.md` where they disagree. Plan first.
-Update `docs/PROGRESS.md` at every GATE and whenever the session ends (keep it under ~150 lines).
+Follow the lumen-shared session protocol (end of this file). `docs/PLAN.md` (local-only, in
+`.git/info/exclude`, never committed) holds this repo's technical design; priorities live in
+`lumen-shared/ROADMAP.md`. Current state lives in `lumen-shared/status/glowline-wled.md`, never in
+this public repo. Plan first.
 
 ## Rules
 
 1. **Plan first**; stop at every GATE.
-2. Stay in this repository. Exception: the attached lumen-shared directory, which may be read;
-   edits there are allowed only in `requests/` and `contracts/firmware.md`.
+2. Stay in this repository. Exception: the attached lumen-shared directory, edited per the session
+   protocol.
 3. **Keys:** never open, print, copy or `cat` anything in `~/.lumen-keys/`. The signing script
    reads keys by path from `$LUMEN_OTA_KEY_DIR`; it may be run, but its output must never contain
    key material. Never commit keys or signed binaries.
 4. **Never flash, erase, or push OTA to any device.** Build only; the maintainer does every device
    operation.
-5. **Frozen** unless a change is justified first and approved: the embedded OTA public keys, the
+5. **Frozen** unless a change is justified first and approved (approved exception, 2026-10-12: the
+   stock `markOTAvalid()` rollback fix in REQ-060; see DECISIONS.md): the embedded OTA public keys, the
    OTA rollback logic (including the `extern "C" verifyRollbackLater()` override), the partition
    table, the usermod's WLED usermod ID, and EUPL/WLED copyright notices.
 6. One variable per release: no upstream WLED merges, platform upgrades, or refactors.
@@ -49,46 +49,17 @@ Envs containing `BENCH` / `DO_NOT_SHIP`, and the `GLOWLINE_OTA_TEST_FORCE_BAD_HO
 bench rollback tests only; never ship their output.
 
 ## Role: on-demand
-Requests in `lumen-shared/requests/` and RUNBOOK.md items on the current release
-priority come first; `docs/PLAN.md` items stay in scope after them. "On-demand" means
+Requests in `lumen-shared/requests/` and ROADMAP.md items for the current milestone come first; `docs/PLAN.md` items stay in scope after them. "On-demand" means
 no new phase starts without the maintainer's go (Rule 1). Bench stability beats features.
 You own `lumen-shared/contracts/firmware.md`.
 
-## Shared context (added 2026-09-24)
+## Shared context
 
-The attached lumen-shared directory is required. If it is not attached (no
-`lumen-shared` in your working directories), stop and ask the maintainer to
-restart the session with it attached.
+`~/dev/lumen-shared` must be attached to this session. If it is not (no `lumen-shared` in your
+working directories), stop and ask Ceddy to restart the session with it attached.
 
-At the START of every session, before `docs/PLAN.md` and `docs/PROGRESS.md`:
-1. `lumen-shared/DECISIONS.md` — settled; never re-open.
-2. `lumen-shared/RUNBOOK.md` — the cross-repo plan. Find the rows and items
-   that name this repo. It outranks `docs/PLAN.md` where they disagree.
-3. `lumen-shared/contracts/*.md` — the interfaces you build against.
-4. `lumen-shared/requests/` — files addressed **To:** this repo are your
-   queue. Take them before PLAN.md items unless the maintainer says otherwise.
+@../lumen-shared/SESSION-PROTOCOL.md
 
-While working:
-- Edit only this repo, plus `lumen-shared/requests/` and the contract file
-  this repo owns. Never edit RUNBOOK.md, DECISIONS.md, or another repo.
-- lumen-shared: commit, never push. Ceddy pushes after each runbook sync so
-  Dannica's clone stays current.
-- Need something from another repo? Do NOT stop. Copy
-  `lumen-shared/requests/_TEMPLATE.md` to `REQ-<nnn>-<slug>.md`, stub or
-  mock it here, keep going.
-- Verify before claiming done (build, tests, bench, curl — whatever proves it).
-
-At every GATE and at the END of every session (unchanged from PLAN.md):
-- Update `docs/PROGRESS.md`. Add a **"For the runbook"** section at the top:
-  one to five lines of what changed that RUNBOOK.md should now say. The
-  maintainer copies those into the runbook. PROGRESS.md is the record; at gates,
-  chat gets the PROGRESS.md diff and whatever the GATE checklist in PLAN.md asks
-  for, nothing more.
-- Before replacing the "For the runbook" block in `docs/PROGRESS.md`, check
-  `~/dev/lumen-shared/RUNBOOK.md` and carry over any old bullet it doesn't cover
-  yet. Match on identifiers (commit hash, deploy version, gate name, REQ number,
-  release version), not wording, because the runbook paraphrases. Drop a bullet
-  once its identifiers appear there.
-- Move requests you completed to `lumen-shared/requests/done/` and update
-  the Status column of the contract file if an interface shipped.
-- Put under **"Needs the maintainer"** only what a session cannot decide.
+The protocol above replaces the old "Shared context" rules (RUNBOOK.md reading, PROGRESS.md and
+"For the runbook" blocks). It outranks anything else in this file about session start, reporting
+and lumen-shared edits.
