@@ -44,6 +44,9 @@ static constexpr bool glowlineStrEq(const char* a, const char* b) {
 }
 static_assert(!glowlineStrEq(GLOWLINE_FW_VERSION, "0.0.0-dev"),
               "lumen env built without a version: set PLATFORMIO_BUILD_FLAGS='-D GLOWLINE_FW_VERSION=\\\"x.y.z\\\"'");
+#ifndef GLOWLINE_OWNS_OTA_VALIDATION
+#error "lumen envs need -D GLOWLINE_OWNS_OTA_VALIDATION: without it stock WLED marks every new image valid at the end of setup() and bootloader rollback never fires (see verifyRollbackLater(), below)."
+#endif
 #endif
 
 // How long a freshly-flashed image has to prove (via a successful WebSocket CONNECT -- see
@@ -114,6 +117,12 @@ static_assert(sizeof(LUMEN_DEVICE_HOST) > 1, "GLOWLINE_BENCH_FORCE_DEFAULT_HOST 
 #if defined(GLOWLINE_OTA_TEST_FORCE_BAD_HOST) && defined(LUMEN_LEGACY_HOST)
 #error "GLOWLINE_OTA_TEST_FORCE_BAD_HOST is for dev-based bench envs only -- never combine it with the prod env's LUMEN_LEGACY_HOST."
 #endif
+// GLOWLINE_BENCH_ABORT_AFTER_MS (bench env only): abort() this many ms after boot, to prove the
+// bootloader rolls a crashing PENDING_VERIFY image back. Paired with the forced bad host, so the
+// image can never mark itself valid before it crashes; never in a prod-based build.
+#if defined(GLOWLINE_BENCH_ABORT_AFTER_MS) && (!defined(GLOWLINE_OTA_TEST_FORCE_BAD_HOST) || defined(LUMEN_LEGACY_HOST))
+#error "GLOWLINE_BENCH_ABORT_AFTER_MS is for the dev-based *_BENCH_ABORT30_DO_NOT_SHIP env only, together with GLOWLINE_OTA_TEST_FORCE_BAD_HOST."
+#endif
 // Either bench host override replaces wsHost in memory only; addToConfig() then writes back what
 // cfg.json actually holds, so no config save can persist the forced host.
 #if defined(GLOWLINE_BENCH_FORCE_DEFAULT_HOST) || defined(GLOWLINE_OTA_TEST_FORCE_BAD_HOST)
@@ -136,6 +145,12 @@ static_assert(sizeof(LUMEN_DEVICE_HOST) > 1, "GLOWLINE_BENCH_FORCE_DEFAULT_HOST 
 // entirely and defer to the application. This usermod's own PENDING_VERIFY/mark-valid/timeout
 // logic (setup()/pollHandshake()/loop(), below) becomes the sole decision-maker once this is in
 // place -- exactly as designed, now actually reachable.
+//
+// Stock WLED cancels PENDING_VERIFY too: markOTAvalid() at the end of WLED::setup()
+// (wled00/wled.cpp, wled00/ota_update.cpp:421-431). Lumen envs build with
+// GLOWLINE_OWNS_OTA_VALIDATION, which skips that call; without it a new image that crashes after
+// setup() is never rolled back by the bootloader, only by the 15-minute timer in loop() (checked
+// for every lumen env near GLOWLINE_FW_VERSION, above).
 #ifdef CONFIG_APP_ROLLBACK_ENABLE
 extern "C" bool verifyRollbackLater() {
   return true;
@@ -343,6 +358,8 @@ class GlowlineUsermod : public Usermod {
     //                on the very next /ota/check in the same connect cycle.
     //   rbPending  -- true if the rolled_back frame for failedVer hasn't been sent yet. Read once
     //                 at boot; cleared the moment that frame actually sends.
+    //   installing -- the version the pull OTA last switched the boot partition to, written just
+    //                 before Update.end(). See checkInstallMarker().
     String otaKnownBadVersion = "";
     bool otaRollbackReportPending = false;
 
@@ -598,6 +615,7 @@ class GlowlineUsermod : public Usermod {
             esp_ota_mark_app_valid_cancel_rollback();
             otaPendingVerify = false;
             Serial.println(F("glowline ota: image marked valid (WS connected)"));
+            clearInstallMarker();
             confirmTokenMove();
             // This confirms a different, working image -- whatever local block existed for a
             // previously-failed version no longer applies. See otaKnownBadVersion's own comment
@@ -1242,6 +1260,57 @@ class GlowlineUsermod : public Usermod {
       resetAndScheduleImmediateConnect();
     }
 
+    // NVS ota/installing. The bootloader rolls back an image that reboots while still
+    // PENDING_VERIFY (marks it ABORTED and boots the previous one; ESP-IDF
+    // bootloader_support/include/esp_flash_partitions.h:69-72),
+    // and the image it falls back to would never know. So the pull OTA records the version it is
+    // installing, and at boot a different running version means that version was rolled back:
+    // it becomes failedVer + rbPending, and the normal path reports ota_result rolled_back.
+    // A matching marker is cleared at mark-valid (pollHandshake()), or at boot if this image isn't
+    // PENDING_VERIFY. Boards before this release never wrote it, so their rollbacks stay unreported.
+    void setInstallMarker(const String& version) {
+      Preferences prefs;
+      bool ok = prefs.begin("ota", false) && prefs.putString("installing", version) == version.length();
+      prefs.end();
+      Serial.print(F("glowline ota: install marker set to "));
+      Serial.print(version);
+      Serial.println(ok ? F("") : F(" -- NVS WRITE FAILED, a rollback of it won't be reported"));
+    }
+
+    void clearInstallMarker() {
+      Preferences prefs;
+      if (prefs.begin("ota", false) && prefs.isKey("installing")) {
+        prefs.remove("installing");
+        Serial.println(F("glowline ota: install marker cleared"));
+      }
+      prefs.end();
+    }
+
+    // Called once from setup(), after otaPendingVerify is known and before failedVer/rbPending are read.
+    void checkInstallMarker() {
+      Preferences prefs;
+      if (!prefs.begin("ota", false)) return;
+      if (!prefs.isKey("installing")) {
+        prefs.end();
+        return;
+      }
+      String installing = prefs.getString("installing", "");
+      if (installing != String(F(GLOWLINE_FW_VERSION))) {
+        prefs.putString("failedVer", installing);
+        prefs.putBool("rbPending", true);
+        prefs.remove("installing");
+        Serial.print(F("glowline ota: install marker says "));
+        Serial.print(installing);
+        Serial.println(F(" was installed, but this image is running -- the bootloader rolled it back"));
+      } else if (!otaPendingVerify) {
+        prefs.remove("installing");
+        Serial.println(F("glowline ota: install marker matches this already-valid image -- cleared"));
+      } else {
+        Serial.println(F("glowline ota: install marker matches this image -- cleared once marked valid"));
+      }
+      prefs.end();
+    }
+
     void sendOtaFailedFrame() {
       String msg = String("{\"type\":\"ota_result\",\"status\":\"failed\",\"error\":\"") + otaFailureReason + "\"}";
       sendFrame(0x1, (const uint8_t*)msg.c_str(), msg.length());
@@ -1431,7 +1500,9 @@ class GlowlineUsermod : public Usermod {
       // Only past this point does anything touch the boot partition selector -- see this
       // usermod's confirmation (readme/commit message) that a power loss at any point before here
       // leaves the currently-running, already-working image untouched.
+      setInstallMarker(version); // before the boot partition switches; see checkInstallMarker()
       if (!Update.end(true)) {
+        clearInstallMarker();
         recordOtaFailure(F("download: Update.end() failed"));
         return;
       }
@@ -1766,6 +1837,9 @@ class GlowlineUsermod : public Usermod {
       Serial.print(F("# glowline: OTA TEST BUILD -- wsHost is FORCED to "));
       Serial.println(F(GLOWLINE_OTA_TEST_BAD_HOST_NAME));
       Serial.println(F("# This build can NEVER complete a real WebSocket connection.    #"));
+#ifdef GLOWLINE_BENCH_ABORT_AFTER_MS
+      Serial.println(F("# It also calls abort() 30 s after boot (bootloader rollback).  #"));
+#endif
       Serial.println(F("# The saved host in cfg.json is ignored but never overwritten.  #"));
       Serial.println(F("# DO NOT SHIP THIS BUILD TO A REAL UNIT"));
       Serial.println(F("################################################################"));
@@ -1813,6 +1887,7 @@ class GlowlineUsermod : public Usermod {
 
       WiFi.onEvent([this](arduino_event_id_t event, arduino_event_info_t info) { onStaEvent(event, info); });
 
+      checkInstallMarker();
       {
         Preferences prefs;
         prefs.begin("ota", true); // read-only
@@ -1891,6 +1966,13 @@ class GlowlineUsermod : public Usermod {
       advanceBootCue();
       trackPower();
 
+#ifdef GLOWLINE_BENCH_ABORT_AFTER_MS
+      if (millis() > GLOWLINE_BENCH_ABORT_AFTER_MS) {
+        Serial.println(F("glowline: BENCH BUILD -- abort() now; the bootloader must roll this image back"));
+        Serial.flush();
+        abort();
+      }
+#endif
       // Rollback timeout: unaffected by anything else in loop() being blocked (the OTA
       // check/download sequence runs on the OLD, already-confirmed image, before any reboot --
       // otaPendingVerify is only ever true on a *different* boot, the one right after flashing the
