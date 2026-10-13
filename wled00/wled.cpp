@@ -774,6 +774,11 @@ void WLED::initConnection()
   // WIFI_MODE_NULL teardown below, which also closed the hotspot on every retry (every 18 s without a
   // phone joined). disconnect(false) leaves the mode at AP+STA; WiFi.begin() below retries alongside.
   const bool keepAP = apActive && !WLEDNetwork.isConnected();
+  // The core's auto-reconnect retries "network not found" back to back (Arduino-ESP32 STA.cpp
+  // _onStaArduinoEvent): a full channel scan every ~4 s, so the radio was off the hotspot's channel
+  // most of the time and phones lost it. With the hotspot up, only WLED's own 18 s retry runs; the
+  // next initConnection() without the hotspot turns it back on.
+  WiFi.setAutoReconnect(!keepAP);
 #else
   const bool keepAP = false;
 #endif
