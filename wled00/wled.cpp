@@ -769,8 +769,16 @@ void WLED::initConnection()
   }
 #endif
 
+#ifdef GLOWLINE_KEEP_SETUP_AP
+  // glowline: a retry while the setup hotspot is up keeps it up -- stop only the STA side and skip the
+  // WIFI_MODE_NULL teardown below, which also closed the hotspot on every retry (every 18 s without a
+  // phone joined). disconnect(false) leaves the mode at AP+STA; WiFi.begin() below retries alongside.
+  const bool keepAP = apActive && !WLEDNetwork.isConnected();
+#else
+  const bool keepAP = false;
+#endif
   DEBUG_PRINTLN(F("WiFi disconnect."));
-  WiFi.disconnect(true); // close old connections
+  WiFi.disconnect(!keepAP); // close old connections
   delay(5);              // wait for hardware to be ready
 #ifdef ESP8266
   WiFi.setPhyMode(force802_3g ? WIFI_PHY_MODE_11G : WIFI_PHY_MODE_11N);
@@ -782,10 +790,12 @@ void WLED::initConnection()
 #ifdef ARDUINO_ARCH_ESP32
   // Reset mode to NULL to force a full STA mode transition, so that WiFi.mode(WIFI_STA) below actually applies the hostname (and TX power, etc.).
   // This is required on reconnects when mode is already WIFI_STA.
-  DEBUG_PRINTLN(F("WiFi mode_null: driver teardown / re-init."));
-  WiFi.mode(WIFI_MODE_NULL);
-  apActive = false;           // the AP is physically torn down by WIFI_MODE_NULL
-  delay(5);                   // give the WiFi stack time to complete the mode transition
+  if (!keepAP) {
+    DEBUG_PRINTLN(F("WiFi mode_null: driver teardown / re-init."));
+    WiFi.mode(WIFI_MODE_NULL);
+    apActive = false;         // the AP is physically torn down by WIFI_MODE_NULL
+    delay(5);                 // give the WiFi stack time to complete the mode transition
+  }
   WiFi.setHostname(hostname);
 #endif
 
