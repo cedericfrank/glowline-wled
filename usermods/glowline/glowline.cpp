@@ -47,6 +47,10 @@ static_assert(!glowlineStrEq(GLOWLINE_FW_VERSION, "0.0.0-dev"),
 #ifndef GLOWLINE_OWNS_OTA_VALIDATION
 #error "lumen envs need -D GLOWLINE_OWNS_OTA_VALIDATION: without it stock WLED marks every new image valid at the end of setup() and bootloader rollback never fires (see verifyRollbackLater(), below)."
 #endif
+// Checked after wled.h, which #undefs it again when WLED_ENABLE_AOTA is set (wled00/wled.h:24-28).
+#ifndef WLED_DISABLE_OTA
+#error "lumen envs need -D WLED_DISABLE_OTA (and no WLED_ENABLE_AOTA): otherwise WLED's /update and /updatebootloader take unsigned firmware from anyone on the LAN or the setup hotspot."
+#endif
 #endif
 
 // How long a freshly-flashed image has to prove (via a successful WebSocket CONNECT -- see
