@@ -241,7 +241,9 @@ customer-onboarding flow yet — see Known debt above.
    hex characters of the MAC) and open its web UI. Go to
    **Config -> Usermods**, fill in the **Lumen** section (stored under the
    `glowline` config key):
-   - **Host** — the WebSocket server hostname (the glowline-app Worker)
+   - **Host** — the WebSocket server hostname (the glowline-app Worker). Lumen builds
+     (`esp32s3_lumen_*`) accept only an empty host or their compiled `LUMEN_DEVICE_HOST` (in prod
+     also `LUMEN_LEGACY_HOST`), and only port 0 or 443; anything else is refused and logged.
    - **Port** — `443`
    - **Device Id** — from step 2
    - **Token** — from step 2 (after saving it shows as `********`)

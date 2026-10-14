@@ -54,6 +54,8 @@ static_assert(!glowlineStrEq(GLOWLINE_FW_VERSION, "0.0.0-dev"),
 #ifndef GLOWLINE_KEEP_SETUP_AP
 #error "lumen envs need -D GLOWLINE_KEEP_SETUP_AP: without it WLED closes the setup hotspot on every retry of an unreachable saved Wi-Fi, so the app can't finish setup (wled.cpp initConnection())."
 #endif
+// Lumen envs dial only their compiled hosts (glowlineHostAllowed(), below).
+#define GLOWLINE_COMPILED_HOSTS_ONLY
 #endif
 
 // How long a freshly-flashed image has to prove (via a successful WebSocket CONNECT -- see
@@ -94,6 +96,33 @@ static_assert(!glowlineStrEq(GLOWLINE_FW_VERSION, "0.0.0-dev"),
 // this string is moved to LUMEN_DEVICE_HOST -- in memory only until the first CONNECTED on the new
 // host (confirmHostMigration()). Until then cfg.json keeps the legacy host, so if the new host
 // fails and the image rolls back, the old image still dials the legacy host and can report it.
+
+#ifdef GLOWLINE_COMPILED_HOSTS_ONLY
+// WLED's POST /json/cfg and Settings -> Usermods take changes from anyone on the LAN or the open
+// setup hotspot, and the board sends its Bearer token to whatever host is set (review firmware H1,
+// REQ-060). Lumen envs accept only an empty host (= the build default), LUMEN_DEVICE_HOST or, in
+// prod, LUMEN_LEGACY_HOST, and only port 0 (= the default) or LUMEN_DEVICE_PORT. readFromConfig()
+// keeps the current value otherwise, at boot too, so a foreign host already in cfg.json falls back
+// to the compiled one. Exact match, like the legacy-host rule. Bench host overrides apply after it.
+static constexpr bool glowlineHostAllowed(const char* host) {
+  return *host == '\0' || glowlineStrEq(host, LUMEN_DEVICE_HOST)
+#ifdef LUMEN_LEGACY_HOST
+         || glowlineStrEq(host, LUMEN_LEGACY_HOST)
+#endif
+      ;
+}
+static constexpr bool glowlinePortAllowed(uint16_t port) { return port == 0 || port == LUMEN_DEVICE_PORT; }
+// Regression checks: loosening the rule fails every lumen build.
+static_assert(glowlineHostAllowed("") && glowlineHostAllowed(LUMEN_DEVICE_HOST), "compiled host must be accepted");
+static_assert(!glowlineHostAllowed("evil.example"), "foreign host must be refused");
+static_assert(!glowlineHostAllowed("x" LUMEN_DEVICE_HOST) && !glowlineHostAllowed(LUMEN_DEVICE_HOST "."),
+              "only an exact match of the compiled host is accepted");
+#ifdef LUMEN_LEGACY_HOST
+static_assert(glowlineHostAllowed(LUMEN_LEGACY_HOST), "the legacy host must stay accepted so its boards migrate");
+#endif
+static_assert(glowlinePortAllowed(0) && glowlinePortAllowed(LUMEN_DEVICE_PORT) && !glowlinePortAllowed(8443) &&
+              !glowlinePortAllowed(80), "only port 0 (default) or LUMEN_DEVICE_PORT is accepted");
+#endif
 
 // GLOWLINE_OTA_TEST_FORCE_BAD_HOST (readFromConfig(), below) permanently breaks this build's
 // ability to ever reach the backend -- it must never be paired with the real 15-minute rollback
@@ -2141,8 +2170,39 @@ class GlowlineUsermod : public Usermod {
       // A key that is left out keeps its current value (2-arg getJsonValue, fcn_declare.h:53); only
       // an explicit value, e.g. token "", changes a setting. At boot the members still hold "" / 0.
       bool configComplete = !top.isNull();
+#ifdef GLOWLINE_COMPILED_HOSTS_ONLY
+      // A left-out or refused value keeps what cfg.json holds now (see glowlineHostAllowed()). With a
+      // bench host override that is benchSavedHost, never the forced host in wsHost.
+#ifdef GLOWLINE_BENCH_HOST_OVERRIDE
+      String cfgHost = benchSavedHost;
+      uint16_t cfgPort = benchSavedPort;
+#else
+      String cfgHost = wsHost;
+      uint16_t cfgPort = wsPort;
+#endif
+      String keptHost = cfgHost;
+      uint16_t keptPort = cfgPort;
+      configComplete &= getJsonValue(top[F("host")], cfgHost);
+      configComplete &= getJsonValue(top[F("port")], cfgPort);
+      if (!glowlineHostAllowed(cfgHost.c_str())) {
+        Serial.print(F("glowline: refused host \""));
+        Serial.print(cfgHost);
+        Serial.println(F("\" -- this build only connects to " LUMEN_DEVICE_HOST));
+        cfgHost = keptHost;
+      }
+      if (!glowlinePortAllowed(cfgPort)) {
+        Serial.print(F("glowline: refused port "));
+        Serial.print(cfgPort);
+        Serial.print(F(" -- this build only connects on port "));
+        Serial.println(LUMEN_DEVICE_PORT);
+        cfgPort = keptPort;
+      }
+      wsHost = cfgHost;
+      wsPort = cfgPort;
+#else
       configComplete &= getJsonValue(top[F("host")], wsHost);
       configComplete &= getJsonValue(top[F("port")], wsPort);
+#endif
       configComplete &= getJsonValue(top[F("deviceId")], wsDeviceId);
       String cfgToken;
       bool hasToken = getJsonValue(top[F("token")], cfgToken);
