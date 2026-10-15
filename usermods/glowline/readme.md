@@ -227,9 +227,12 @@ customer-onboarding flow yet — see Known debt above.
    the unit in step 5.
 
 3. **Join the unit's setup AP.** On first boot with no WiFi configured, the
-   unit broadcasts its own open (no password) access point named
-   `Lumen-XXXX`, where `XXXX` is the last 4 hex characters of its MAC
-   address. Join that network from your phone.
+   unit broadcasts its own access point named `Lumen-XXXX`, where `XXXX` is
+   the last 4 hex characters of its MAC address. Join that network from your
+   phone. A hand-built unit has no passphrase in NVS, so the access point is
+   open; on lumen builds (`GLOWLINE_AP_PASS_FROM_NVS`) a unit with a WPA2
+   passphrase in NVS (`glowline/ap_psk`, 8-63 printable characters) uses it
+   instead, and a password set in Settings or over the JSON API is ignored.
 
 4. **Enter home WiFi credentials.** WLED's captive portal should open
    automatically on joining the AP (or browse to `4.3.2.1` / `wled.local`
