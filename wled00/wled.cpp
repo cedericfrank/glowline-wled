@@ -704,6 +704,10 @@ void WLED::beginStrip()
   colorUpdated(CALL_MODE_INIT); // apply color & initiate transition, do not send notification
 }
 
+#ifdef GLOWLINE_AP_PASS_FROM_NVS
+void glowlineApplyApPass(); // usermods/glowline/glowline.cpp
+#endif
+
 void WLED::initAP(bool resetAP)
 {
   if (apBehavior == AP_BEHAVIOR_BUTTON_ONLY && !resetAP)
@@ -713,6 +717,11 @@ void WLED::initAP(bool resetAP)
     WLED_SET_AP_SSID();
     strcpy_P(apPass, PSTR(WLED_AP_PASS));
   }
+#ifdef GLOWLINE_AP_PASS_FROM_NVS
+  // glowline: the hotspot always uses the board's own passphrase from NVS (open without one), also
+  // after the BOOT-button reset above and whatever ap.psk the LAN or Settings saved.
+  glowlineApplyApPass();
+#endif
   DEBUG_PRINT(F("Opening access point "));
   DEBUG_PRINTLN(apSSID);
 

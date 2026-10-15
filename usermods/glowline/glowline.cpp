@@ -54,6 +54,9 @@ static_assert(!glowlineStrEq(GLOWLINE_FW_VERSION, "0.0.0-dev"),
 #ifndef GLOWLINE_KEEP_SETUP_AP
 #error "lumen envs need -D GLOWLINE_KEEP_SETUP_AP: without it WLED closes the setup hotspot on every retry of an unreachable saved Wi-Fi, so the app can't finish setup (wled.cpp initConnection())."
 #endif
+#ifndef GLOWLINE_AP_PASS_FROM_NVS
+#error "lumen envs need -D GLOWLINE_AP_PASS_FROM_NVS: without it the setup hotspot ignores the board's own passphrase and stays open (see glowlineApplyApPass(), below)."
+#endif
 // Lumen envs dial only their compiled hosts (glowlineHostAllowed(), below).
 #define GLOWLINE_COMPILED_HOSTS_ONLY
 #endif
@@ -190,6 +193,57 @@ static_assert(sizeof(LUMEN_DEVICE_HOST) > 1, "GLOWLINE_BENCH_FORCE_DEFAULT_HOST 
 #ifdef CONFIG_APP_ROLLBACK_ENABLE
 extern "C" bool verifyRollbackLater() {
   return true;
+}
+#endif
+
+#ifdef GLOWLINE_AP_PASS_FROM_NVS
+// Setup hotspot passphrase (lumen-shared contracts/firmware.md, SoftAP provisioning rows 1 and 8).
+// The factory station writes it to NVS next to the token; NVS survives the BOOT >10 s file-system
+// format. The server made it and hands it to the owner at claim time, so the board never changes it:
+// a passphrase set over the LAN (POST /json/cfg ap.psk) or in Settings is overridden in initAP().
+// Only 8-63 printable ASCII characters are a valid WPA2 passphrase; with anything else
+// WiFi.softAP() would refuse to start the hotspot at all, so the board stays open instead.
+static constexpr const char* AP_PSK_NVS_NS = "glowline";
+static constexpr const char* AP_PSK_NVS_KEY = "ap_psk";
+static char glowlineApPsk[64] = "";      // "" = no passphrase: open hotspot
+static char glowlineApPskFp[9] = "";     // first 8 hex of SHA-256(passphrase), for the station's check
+static bool glowlineApPskLoaded = false;
+
+static bool glowlineApPskValid(const char* p) {
+  size_t n = strlen(p);
+  if (n < 8 || n > 63) return false;
+  for (size_t i = 0; i < n; i++) if (p[i] < 0x20 || p[i] > 0x7e) return false;
+  return true;
+}
+
+// Read once: only the station writes the key, and it reboots the board afterwards.
+static const char* glowlineApPskGet() {
+  if (glowlineApPskLoaded) return glowlineApPsk;
+  glowlineApPskLoaded = true;
+  Preferences prefs;
+  // A read-only begin() fails when the namespace was never written (unprovisioned board): open.
+  if (!prefs.begin(AP_PSK_NVS_NS, true)) return glowlineApPsk;
+  if (prefs.isKey(AP_PSK_NVS_KEY)) {
+    char buf[65] = "";
+    // getString() returns 0 when the value doesn't fit (Preferences.cpp getString(key, char*, maxLen))
+    if (prefs.getString(AP_PSK_NVS_KEY, buf, sizeof(buf)) > 0 && glowlineApPskValid(buf)) {
+      strlcpy(glowlineApPsk, buf, sizeof(glowlineApPsk));
+      uint8_t hash[32];
+      mbedtls_sha256((const unsigned char*)glowlineApPsk, strlen(glowlineApPsk), hash, 0 /* SHA-256 */);
+      for (int i = 0; i < 4; i++) snprintf(glowlineApPskFp + 2 * i, 3, "%02x", hash[i]);
+      Serial.printf("glowline ap: WPA2 passphrase from NVS (fp %s)\n", glowlineApPskFp);
+    } else {
+      Serial.println(F("glowline ap: NVS passphrase is not 8-63 printable characters, hotspot stays open"));
+    }
+    memset(buf, 0, sizeof(buf));
+  }
+  prefs.end();
+  return glowlineApPsk;
+}
+
+// Called by WLED::initAP() (wled00/wled.cpp) right before WiFi.softAP().
+void glowlineApplyApPass() {
+  strlcpy(apPass, glowlineApPskGet(), sizeof(apPass));
 }
 #endif
 
@@ -2125,6 +2179,17 @@ class GlowlineUsermod : public Usermod {
           wifi[F("state")] = F("connecting");
         }
       }
+
+#ifdef GLOWLINE_AP_PASS_FROM_NVS
+      // Hotspot security; never the passphrase, only a short fingerprint the station compares.
+      JsonObject ap = lumen.createNestedObject(F("ap"));
+      if (*glowlineApPskGet()) {
+        ap[F("security")] = F("wpa2");
+        ap[F("fp")] = glowlineApPskFp;
+      } else {
+        ap[F("security")] = F("open");
+      }
+#endif
 
       JsonObject server = lumen.createNestedObject(F("server"));
       if (wsHost.length() == 0 || wsPort == 0 || wsDeviceId.length() == 0 || wsToken.length() == 0) {
