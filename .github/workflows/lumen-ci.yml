@@ -1,0 +1,53 @@
+name: Lumen CI
+
+# Builds the two Lumen release envs on every push and PR. A green run also proves the
+# lumen-env build guards still hold (OTA validation, no LAN OTA, kept setup AP, NVS AP
+# passphrase): each env refuses to build without them.
+# No artifacts are uploaded: CI images are unsigned and must never be shipped.
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.environment }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [esp32s3_lumen_prod, esp32s3_lumen_dev]
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version-file: '.nvmrc'
+        cache: 'npm'
+    - run: npm ci
+    - run: npm test
+    - name: Cache PlatformIO
+      uses: actions/cache@v4
+      with:
+        path: |
+              ~/.platformio
+              ~/.buildcache
+        key: lumen-pio-${{ runner.os }}-${{ matrix.environment }}-${{ hashFiles('platformio.ini', 'platformio_override.ini', 'requirements.txt') }}
+        restore-keys: lumen-pio-${{ runner.os }}-${{ matrix.environment }}-
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        cache: 'pip'
+    - name: Install PlatformIO
+      run: pip install -r requirements.txt
+    - name: Build firmware
+      env:
+        # Lumen envs refuse to build as 0.0.0-dev (glowline.cpp static_assert).
+        PLATFORMIO_BUILD_FLAGS: '-D GLOWLINE_FW_VERSION=\"0.0.0-ci\"'
+      run: pio run -e ${{ matrix.environment }}
