@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: EUPL-1.2
+// Copyright (c) 2026 the Lumen authors. Part of a modified version of WLED; see NOTICE.md.
 // BENCH ONLY -- DO NOT SHIP. See readme.md. Everything is behind LUMEN_BLE_HEAP_PROBE so the
 // `custom_usermods = *` envs (no BLE library on their platform) compile this file as empty.
 #ifdef LUMEN_BLE_HEAP_PROBE

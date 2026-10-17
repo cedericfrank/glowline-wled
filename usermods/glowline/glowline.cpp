@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: EUPL-1.2
+// Copyright (c) 2026 the Lumen authors. Part of a modified version of WLED; see NOTICE.md.
 #include "wled.h"
 #include <WiFi.h>
 #include <base64.h>
@@ -47,7 +49,7 @@ static_assert(!glowlineStrEq(GLOWLINE_FW_VERSION, "0.0.0-dev"),
 #ifndef GLOWLINE_OWNS_OTA_VALIDATION
 #error "lumen envs need -D GLOWLINE_OWNS_OTA_VALIDATION: without it stock WLED marks every new image valid at the end of setup() and bootloader rollback never fires (see verifyRollbackLater(), below)."
 #endif
-// Checked after wled.h, which #undefs it again when WLED_ENABLE_AOTA is set (wled00/wled.h:24-28).
+// Checked after wled.h, which #undefs it again when WLED_ENABLE_AOTA is set (wled00/wled.h:25-29).
 #ifndef WLED_DISABLE_OTA
 #error "lumen envs need -D WLED_DISABLE_OTA (and no WLED_ENABLE_AOTA): otherwise WLED's /update and /updatebootloader take unsigned firmware from anyone on the LAN or the setup hotspot."
 #endif

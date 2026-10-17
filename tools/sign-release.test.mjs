@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: EUPL-1.2
+// Copyright (c) 2026 the Lumen authors. Part of a modified version of WLED; see NOTICE.md.
 // Tests for tools/sign-release.mjs's check of the version compiled into the image. Run: npm test
 // Uses a throwaway key in a temp dir, never $LUMEN_OTA_KEY_DIR: it can't match the embedded public
 // key, so an image that passes the version check stops at the signature self-check, unsigned.
