@@ -1,3 +1,4 @@
+// Modified for Lumen (see NOTICE.md for what changed and when).
 #include "wled.h"
 #include "fcn_declare.h"
 #include "const.h"

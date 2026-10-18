@@ -9,6 +9,10 @@
   <a href="https://gitpod.io/#https://github.com/wled-dev/WLED"><img src="https://img.shields.io/badge/Gitpod-ready--to--code-blue?style=flat-square&logo=gitpod"></a>
 </p>
 
+> **This is the Lumen fork of WLED.** It is a modified version of WLED, licensed under the
+> [EUPL v1.2](LICENSE) like the original. What changed and when: [NOTICE.md](NOTICE.md). The rest
+> of this readme is WLED's own.
+
 # Welcome to WLED! ✨
 
 A fast and feature-rich firmware for ESP32 microcontrollers to control addressable LEDs — from simple strips to large 2D matrices and HUB75 panels.

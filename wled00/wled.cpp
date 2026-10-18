@@ -1,3 +1,4 @@
+// Modified for Lumen (see NOTICE.md for what changed and when).
 #define WLED_DEFINE_GLOBAL_VARS //only in one source file, wled.cpp!
 #include "wled.h"
 #include "wled_ethernet.h"

@@ -1,3 +1,4 @@
+// Modified for Lumen (see NOTICE.md for what changed and when).
 #pragma once
 #ifndef WLED_CONST_H
 #define WLED_CONST_H
