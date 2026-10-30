@@ -26,6 +26,8 @@ Every individual change, with its date and author, is in this repository's git h
 | `wled00/const.h` | Default mDNS name prefix can be set per build (`lumen-XXXXXX`) | 2026-09-22 |
 | `wled00/util.cpp` | Uses that mDNS name prefix for the fallback host name | 2026-09-22 |
 | `wled00/wled.cpp` | mDNS name prefix; the usermod confirms a new firmware image instead of `setup()`; the setup hotspot stays up during Wi-Fi retries; the hotspot uses the board's own passphrase | 2026-09-22, 2026-10-12, 2026-10-13, 2026-10-14 |
+| `wled00/wled_serial.cpp` | A `{"lumen":{...}}` line on the serial port goes to the usermod's setup command instead of the JSON state API | 2026-10-30 |
+| `wled00/data/settings_sec.htm` | The About section names this modified version and links its source code | 2026-10-30 |
 
 ### Files added by this fork
 
@@ -33,6 +35,7 @@ Every individual change, with its date and author, is in this repository's git h
 - `usermods/ble_heap_probe/`: a bench-only measurement usermod, never shipped.
 - `platformio_override.ini`: the Lumen build environments.
 - `tools/sign-release.mjs` and its test: signs firmware images for release.
+- `tools/flash-manifest.mjs` and its test: lists a release's flash parts for the browser flasher.
 - `.github/workflows/lumen-ci.yml`: builds the Lumen environments on every push.
 - `docs/DELIVERY-ACK.md`, `CLAUDE.md`, `NOTICE.md`, `.gitattributes`, and small edits to
   `.gitignore` and `.vscode/extensions.json`.
