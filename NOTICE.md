@@ -34,6 +34,7 @@ Every individual change, with its date and author, is in this repository's git h
 - `usermods/ble_heap_probe/`: a bench-only measurement usermod, never shipped.
 - `platformio_override.ini`: the Lumen build environments.
 - `tools/sign-release.mjs` and its test: signs firmware images for release.
+- `tools/flash-manifest.mjs` and its test: lists a release's flash parts for the browser flasher.
 - `.github/workflows/lumen-ci.yml`: builds the Lumen environments on every push.
 - `docs/DELIVERY-ACK.md`, `CLAUDE.md`, `NOTICE.md`, `.gitattributes`, and small edits to
   `.gitignore` and `.vscode/extensions.json`.

@@ -197,7 +197,12 @@ name contains `BENCH` / `DO_NOT_SHIP` are bench rollback tests; never ship their
    `build_output/release/` (WLED copies every build there under a generic name).
 
 2. Copy it to `dist/<env>-<version>/firmware.bin` (`dist/` is gitignored; never commit signed
-   binaries).
+   binaries), with the three parts a blank board also needs:
+
+   ```
+   cp .pio/build/<env>/bootloader.bin .pio/build/<env>/partitions.bin \
+      ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin dist/<env>-<version>/
+   ```
 
 3. Sign it. The private key is read by path from `$LUMEN_OTA_KEY_DIR` (absolute path; the key file
    must be `chmod 600` or stricter); `--keyFile` is a bare filename in that directory:
@@ -210,7 +215,19 @@ name contains `BENCH` / `DO_NOT_SHIP` are bench rollback tests; never ship their
    `GLOWLINE_FW_VERSION=<version>` string in the binary, present once) and refuses otherwise: a
    board reports the compiled version, so a mismatch would be offered again and again. It then
    checks the new signature against the public key embedded in `glowline.cpp` and writes `manifest.json` (`version`, `size`, `sha256`, `keyId`, `signature`) next to the image.
-   Upload both through the backend's firmware admin page.
+
+4. List the flash parts for the browser flasher (no key involved):
+
+   ```
+   node tools/flash-manifest.mjs --dir dist/<env>-<version>
+   ```
+
+   It writes `flash.json` (each part's offset, size and SHA-256) after checking that `firmware.bin`
+   is the image `manifest.json` signed, that the image dials its own env's host, and that
+   `partitions.bin` is the Lumen layout. It refuses BENCH / DO_NOT_SHIP folders.
+
+5. Upload `firmware.bin`, `manifest.json`, `flash.json`, `bootloader.bin`, `partitions.bin` and
+   `boot_app0.bin` through the backend's firmware admin page.
 
 ## Provisioning a new unit (current manual process)
 
