@@ -27,6 +27,7 @@ Every individual change, with its date and author, is in this repository's git h
 | `wled00/util.cpp` | Uses that mDNS name prefix for the fallback host name | 2026-09-22 |
 | `wled00/wled.cpp` | mDNS name prefix; the usermod confirms a new firmware image instead of `setup()`; the setup hotspot stays up during Wi-Fi retries; the hotspot uses the board's own passphrase | 2026-09-22, 2026-10-12, 2026-10-13, 2026-10-14 |
 | `wled00/wled_serial.cpp` | A `{"lumen":{...}}` line on the serial port goes to the usermod's setup command instead of the JSON state API | 2026-10-30 |
+| `wled00/data/settings_sec.htm` | The About section names this modified version and links its source code | 2026-10-30 |
 
 ### Files added by this fork
 
