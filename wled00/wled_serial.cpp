@@ -1,7 +1,11 @@
+// Modified for Lumen (see NOTICE.md for what changed and when).
 #include "wled.h"
 
 // forward declarations
 static void sendBytes();
+#ifdef GLOWLINE_SERIAL_PROVISION
+void glowlineSerialCommand(JsonObject cmd); // usermods/glowline/glowline.cpp
+#endif
 
 /*
  * Adalight and TPM2 handler
@@ -111,6 +115,14 @@ void handleSerial()
           }
           Serial.setTimeout(100);
           DeserializationError error = deserializeJson(*pDoc, Serial);
+#ifdef GLOWLINE_SERIAL_PROVISION
+          // Lumen: a top-level "lumen" object is a serial-only command for the glowline usermod
+          // (lumen-shared contracts/firmware.md "Serial provisioning"). It never reaches
+          // deserializeState(), which the LAN JSON API and the server's messages also go through.
+          if (!error && (*pDoc)["lumen"].is<JsonObject>()) {
+            glowlineSerialCommand((*pDoc)["lumen"].as<JsonObject>());
+          } else
+#endif
           if (!error) {
             verboseResponse = deserializeState(pDoc->as<JsonObject>());
             //only send response if TX pin is unused for other purposes

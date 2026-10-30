@@ -59,6 +59,9 @@ static_assert(!glowlineStrEq(GLOWLINE_FW_VERSION, "0.0.0-dev"),
 #ifndef GLOWLINE_AP_PASS_FROM_NVS
 #error "lumen envs need -D GLOWLINE_AP_PASS_FROM_NVS: without it the setup hotspot ignores the board's own passphrase and stays open (see glowlineApplyApPass(), below)."
 #endif
+#ifndef GLOWLINE_SERIAL_PROVISION
+#error "lumen envs need -D GLOWLINE_SERIAL_PROVISION: without it the browser flasher can't set up a board (see glowlineSerialCommand(), below)."
+#endif
 // Lumen envs dial only their compiled hosts (glowlineHostAllowed(), below).
 #define GLOWLINE_COMPILED_HOSTS_ONLY
 #endif
@@ -198,6 +201,9 @@ extern "C" bool verifyRollbackLater() {
 }
 #endif
 
+#if defined(GLOWLINE_SERIAL_PROVISION) && !defined(GLOWLINE_AP_PASS_FROM_NVS)
+#error "GLOWLINE_SERIAL_PROVISION needs GLOWLINE_AP_PASS_FROM_NVS (it writes the hotspot passphrase that flag reads)"
+#endif
 #ifdef GLOWLINE_AP_PASS_FROM_NVS
 // Setup hotspot passphrase (lumen-shared contracts/firmware.md, SoftAP provisioning rows 1 and 8).
 // The factory station writes it to NVS next to the token; NVS survives the BOOT >10 s file-system
@@ -345,6 +351,16 @@ class GlowlineUsermod : public Usermod {
     bool tokenInNvs = false; // the NVS copy matches wsToken (write verified)
     static constexpr const char* TOKEN_NVS_NS = "glowline";
     static constexpr const char* TOKEN_MASK = "********";
+
+#ifdef GLOWLINE_SERIAL_PROVISION
+    // Serial provisioning (serialCommand()): SAVING waits for WLED's loop to write cfg.json with the
+    // new device ID; then the board answers and reboots (REBOOTING refuses every further command).
+    enum class ProvState : uint8_t { IDLE, SAVING, REBOOTING };
+    ProvState provState = ProvState::IDLE;
+    unsigned long provSavingSince = 0;
+    char provFp[9] = "";  // fingerprint of the passphrase just written, "" = none (open hotspot)
+    static const unsigned long PROV_SAVE_TIMEOUT_MS = 4000;
+#endif
 
     // Local status for GET /json/info (addToJsonInfo()), so the app can say why setup failed.
     // Written by the Wi-Fi event task (onStaEvent()), read by the web server task.
@@ -2057,6 +2073,9 @@ class GlowlineUsermod : public Usermod {
       }
       advanceBootCue();
       trackPower();
+#ifdef GLOWLINE_SERIAL_PROVISION
+      serialProvisionTick();
+#endif
 
 #ifdef GLOWLINE_BENCH_ABORT_AFTER_MS
       if (millis() > GLOWLINE_BENCH_ABORT_AFTER_MS) {
@@ -2151,12 +2170,168 @@ class GlowlineUsermod : public Usermod {
       oappend(F("addInfo('glowline:token',1,'Auth token, stored on the board and never shown. Type a new one to replace it; clear the field to remove it.');"));
     }
 
+#ifdef GLOWLINE_SERIAL_PROVISION
+    // Serial provisioning (lumen-shared contracts/firmware.md "Serial provisioning", REQ-129). A
+    // browser flasher sends the device ID, token and hotspot passphrase it got from the factory API
+    // over the UART port, and the board writes them itself. Accepted only on a blank board (no
+    // device ID, no token or passphrase in NVS, no saved Wi-Fi), which is exactly the state after a
+    // full erase and flash, so a USB cable can't quietly re-point a board that is set up.
+    // Every reply is one line {"lumen":{"prov":{...}}}. The token and the passphrase are never
+    // echoed or logged: a reply carries only the device ID and the passphrase's fingerprint.
+    void serialCommand(JsonObject cmd) {
+      const char* name = cmd["cmd"] | "";
+      if (strcmp(name, "prov_check") == 0) {
+        const char* err = provisionRefusal();
+        if (err) replyProvError("prov_check", err);
+        else Serial.println(F("{\"lumen\":{\"prov\":{\"cmd\":\"prov_check\",\"ok\":true}}}"));
+      } else if (strcmp(name, "provision") == 0) {
+        provision(cmd);
+      } else {
+        Serial.println(F("{\"lumen\":{\"prov\":{\"ok\":false,\"err\":\"unknown_cmd\"}}}"));
+      }
+    }
+
+  private:
+    // nullptr = the board may be provisioned; else the reply's err code.
+    const char* provisionRefusal() {
+      if (provState != ProvState::IDLE) return "busy";
+      if (wsDeviceId.length() > 0) return "has_device";
+      if (wsToken.length() > 0 || nvsHasKey(TOKEN_NVS_NS, "token")) return "has_token";
+      if (nvsHasKey(AP_PSK_NVS_NS, AP_PSK_NVS_KEY)) return "has_ap";
+      if (WLED_WIFI_CONFIGURED) return "has_wifi";
+      return nullptr;
+    }
+
+    static bool nvsHasKey(const char* ns, const char* key) {
+      Preferences prefs;
+      if (!prefs.begin(ns, true)) return false; // a read-only begin() fails when the namespace was never written
+      bool has = prefs.isKey(key);
+      prefs.end();
+      return has;
+    }
+
+    // The device ID as the factory API makes it: a UUID, lowercase.
+    static bool isLowerUuid(const char* s) {
+      if (strlen(s) != 36) return false;
+      for (int i = 0; i < 36; i++) {
+        char c = s[i];
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+          if (c != '-') return false;
+        } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    // The token as the factory API makes it: 64 hex characters.
+    static bool isHex64(const char* s) {
+      if (strlen(s) != 64) return false;
+      for (int i = 0; i < 64; i++) if (!isxdigit((unsigned char)s[i])) return false;
+      return true;
+    }
+
+    static void replyProvError(const char* cmd, const char* err) {
+      Serial.printf("{\"lumen\":{\"prov\":{\"cmd\":\"%s\",\"ok\":false,\"err\":\"%s\"}}}\n", cmd, err);
+    }
+
+    void provision(JsonObject cmd) {
+      const char* err = provisionRefusal();
+      if (err) return replyProvError("provision", err);
+      const char* device = cmd["device"] | "";
+      const char* token = cmd["token"] | "";
+      JsonVariant apVar = cmd["ap"];
+      if (!isLowerUuid(device)) return replyProvError("provision", "bad_device");
+      if (!isHex64(token)) return replyProvError("provision", "bad_token");
+      const char* ap = nullptr; // left out: the hotspot stays open, as on the station
+      if (!apVar.isNull()) {
+        ap = apVar.as<const char*>();
+        if (!ap || !glowlineApPskValid(ap)) return replyProvError("provision", "bad_ap");
+      }
+
+      // NVS first, read back; on any failure both keys are removed, so the board keeps nothing.
+      Preferences prefs;
+      bool ok = prefs.begin(TOKEN_NVS_NS, false)
+             && prefs.putString("token", token) == strlen(token)
+             && prefs.getString("token", "") == token;
+      if (ok && ap) {
+        ok = prefs.putString(AP_PSK_NVS_KEY, ap) == strlen(ap) && prefs.getString(AP_PSK_NVS_KEY, "") == ap;
+      }
+      if (!ok) {
+        prefs.remove("token");
+        prefs.remove(AP_PSK_NVS_KEY);
+      }
+      prefs.end();
+      if (!ok) return replyProvError("provision", "nvs_failed");
+
+      provFp[0] = '\0';
+      if (ap) {
+        uint8_t hash[32];
+        mbedtls_sha256((const unsigned char*)ap, strlen(ap), hash, 0 /* SHA-256 */);
+        for (int i = 0; i < 4; i++) snprintf(provFp + 2 * i, 3, "%02x", hash[i]);
+      }
+      // The device ID goes to cfg.json through addToConfig() (token as TOKEN_MASK: it is in NVS).
+      // WLED's loop writes it; serialProvisionTick() then checks the file, answers and reboots.
+      wsDeviceId = device;
+      wsToken = token;
+      tokenInNvs = true;
+      tokenPlainOnDisk = false;
+      configNeedsWrite = true;
+      provState = ProvState::SAVING;
+      provSavingSince = millis();
+      Serial.println(F("glowline prov: token and passphrase saved to NVS, writing cfg.json"));
+    }
+
+    // From loop(): finishes a provision once cfg.json is written.
+    void serialProvisionTick() {
+      if (provState != ProvState::SAVING) return;
+      if (configNeedsWrite) {
+        if (millis() - provSavingSince > PROV_SAVE_TIMEOUT_MS) undoProvision();
+        return;
+      }
+      File f = WLED_FS.open("/cfg.json", "r");
+      bool saved = f && f.find(wsDeviceId.c_str());
+      if (f) f.close();
+      if (!saved) return undoProvision();
+      Serial.printf("{\"lumen\":{\"prov\":{\"cmd\":\"provision\",\"ok\":true,\"device\":\"%s\",\"fp\":", wsDeviceId.c_str());
+      if (provFp[0]) Serial.printf("\"%s\"}}}\n", provFp);
+      else Serial.println(F("null}}}"));
+      Serial.println(F("glowline prov: provisioned, rebooting"));
+      Serial.flush();
+      provState = ProvState::REBOOTING;
+      doReboot = true; // WLED's loop restarts the board (wled.cpp)
+    }
+
+    // cfg.json wasn't written in time, or doesn't hold the device ID: back to blank.
+    void undoProvision() {
+      Preferences prefs;
+      if (prefs.begin(TOKEN_NVS_NS, false)) {
+        prefs.remove("token");
+        prefs.remove(AP_PSK_NVS_KEY);
+        prefs.end();
+      }
+      wsDeviceId = "";
+      wsToken = "";
+      tokenInNvs = false;
+      provFp[0] = '\0';
+      configNeedsWrite = true; // write cfg.json again, without the device ID
+      provState = ProvState::IDLE;
+      replyProvError("provision", "cfg_failed");
+      Serial.println(F("glowline prov: cfg.json not written, provisioning undone"));
+    }
+
+  public:
+#endif
+
     // GET /json/info -> "lumen": who this board is and why it isn't online, for the app's setup flow
     // (lumen-shared contracts/firmware.md, "SoftAP provisioning"). Never the token.
     void addToJsonInfo(JsonObject& root) {
       JsonObject lumen = root.createNestedObject(F("lumen"));
       lumen[F("fw")] = F(GLOWLINE_FW_VERSION);
       lumen[F("device")] = wsDeviceId;
+#ifdef GLOWLINE_SERIAL_PROVISION
+      lumen.createNestedArray(F("caps")).add(F("serial_prov")); // REQ-129: the flasher checks this before provisioning
+#endif
 
       JsonObject wifi = lumen.createNestedObject(F("wifi"));
       uint8_t reason = staLastReason;
@@ -2370,3 +2545,11 @@ class GlowlineUsermod : public Usermod {
 
 static GlowlineUsermod glowline;
 REGISTER_USERMOD(glowline);
+
+#ifdef GLOWLINE_SERIAL_PROVISION
+// Called by WLED's serial handler (wled00/wled_serial.cpp) for a {"lumen":{...}} line, with the JSON
+// buffer locked. Serial only: see GlowlineUsermod::serialCommand().
+void glowlineSerialCommand(JsonObject cmd) {
+  glowline.serialCommand(cmd);
+}
+#endif
