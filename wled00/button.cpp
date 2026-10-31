@@ -14,6 +14,10 @@
 
 static const char _mqtt_topic_button[] PROGMEM = "%s/button/%d";  // optimize flash usage
 
+#ifdef GLOWLINE_IMPROV_BLE
+void glowlineBleBootRequest(); // usermods/glowline/glowline.cpp: restart with Bluetooth setup and the hotspot on
+#endif
+
 // Runtime state private to this file - previously WLED_GLOBAL, a leftover from
 // when all state lived in one big extern block regardless of who used it.
 static unsigned long lastOnTime = 0;
@@ -333,7 +337,11 @@ void handleButton()
           WLED_FS.format();
           doReboot = true;
         } else {
+#ifdef GLOWLINE_IMPROV_BLE
+          glowlineBleBootRequest(); // Lumen: BLE can't restart without a reboot, so the hotspot opens after one
+#else
           WLED::instance().initAP(true);
+#endif
         }
       } else if (!buttons[b].longPressed) { //short press
         //NOTE: this interferes with double click handling in usermods so usermod needs to implement full button handling

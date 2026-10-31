@@ -12,6 +12,8 @@
 #include "mbedtls/md.h"
 #include "mbedtls/sha256.h"
 #include "mbedtls/base64.h"
+#include "mbedtls/platform_util.h"
+#include "glowline_ble.h"
 
 #if __has_include(<WiFiClientSecure.h>)
   #include <WiFiClientSecure.h>
@@ -61,6 +63,9 @@ static_assert(!glowlineStrEq(GLOWLINE_FW_VERSION, "0.0.0-dev"),
 #endif
 #ifndef GLOWLINE_SERIAL_PROVISION
 #error "lumen envs need -D GLOWLINE_SERIAL_PROVISION: without it the browser flasher can't set up a board (see glowlineSerialCommand(), below)."
+#endif
+#ifndef GLOWLINE_IMPROV_BLE
+#error "lumen envs need -D GLOWLINE_IMPROV_BLE: without it the app can't set up the board's Wi-Fi over Bluetooth (glowline_ble.cpp)."
 #endif
 // Lumen envs dial only their compiled hosts (glowlineHostAllowed(), below).
 #define GLOWLINE_COMPILED_HOSTS_ONLY
@@ -255,6 +260,29 @@ void glowlineApplyApPass() {
 }
 #endif
 
+#if defined(GLOWLINE_IMPROV_BLE) && !defined(GLOWLINE_AP_PASS_FROM_NVS)
+#error "GLOWLINE_IMPROV_BLE needs GLOWLINE_AP_PASS_FROM_NVS (the BLE key comes from the hotspot passphrase)"
+#endif
+#ifdef GLOWLINE_IMPROV_BLE
+// BLE can't start again once released (BLEDevice::deinit(true)), so holding BOOT 5-10 s, which opens
+// the hotspot in stock WLED (button.cpp), restarts the board instead with this flag set: the next
+// boot opens the hotspot and BLE together for BLE_BOOT_WINDOW_MS, even with working Wi-Fi.
+static constexpr const char* BLE_BOOT_NVS_KEY = "ble_boot";
+void glowlineBleBootRequest() {
+  Preferences prefs;
+  bool ok = prefs.begin(AP_PSK_NVS_NS, false) && prefs.putBool(BLE_BOOT_NVS_KEY, true) == 1;
+  prefs.end();
+  if (!ok) {
+    // Without the flag a restart would bring neither: open the hotspot the stock way instead.
+    Serial.println(F("glowline ble: BOOT held, NVS write FAILED, opening the hotspot without Bluetooth"));
+    WLED::instance().initAP(true);
+    return;
+  }
+  Serial.println(F("glowline ble: BOOT held, restarting with Bluetooth setup and the hotspot on"));
+  doReboot = true;
+}
+#endif
+
 /*
  * Diagnostic + control usermod: bridges WLED to a Glowline backend over
  * WebSocket, applying whatever state it's sent.
@@ -360,6 +388,28 @@ class GlowlineUsermod : public Usermod {
     unsigned long provSavingSince = 0;
     char provFp[9] = "";  // fingerprint of the passphrase just written, "" = none (open hotspot)
     static const unsigned long PROV_SAVE_TIMEOUT_MS = 4000;
+#endif
+
+#ifdef GLOWLINE_IMPROV_BLE
+    // Wi-Fi setup over Bluetooth (glowline_ble.cpp, REQ-131). Up exactly while the setup hotspot is
+    // up, at most once per boot; released before the first TLS connect (bleHoldsTls()). After a
+    // phone sends Wi-Fi settings, BLE_ATTEMPT_MS bounds the wait for the result.
+    bool bleStartTried = false;
+    bool bleBootWindow = false;            // this boot came from BOOT 5-10 s (glowlineBleBootRequest())
+    bool bleBootApReopened = false;        // the window's hotspot, reopened once after the STA connected
+    unsigned long bleBootWindowStartedAt = 0;
+    bool bleAttemptPending = false;        // Wi-Fi settings from a phone, result not reported yet
+    unsigned long bleAttemptAt = 0;
+    uint8_t bleAttemptRecentCount = 0;     // staRecentCount when the attempt started
+    unsigned long bleReleaseAt = 0;        // 0 = no release scheduled
+    bool identifyActive = false;
+    unsigned long identifyStartedAt = 0;
+    uint8_t identifySavedBri = 0, identifySavedBriLast = 0;
+    static const unsigned long BLE_BOOT_WINDOW_MS = 5UL * 60UL * 1000UL;
+    static const unsigned long BLE_ATTEMPT_MS = 30000;
+    static const unsigned long BLE_RESULT_GRACE_MS = 3000;  // the phone reads the result before BLE goes
+    static const unsigned long IDENTIFY_PULSE_MS = 300;
+    static const uint8_t IDENTIFY_PULSES = 3;
 #endif
 
     // Local status for GET /json/info (addToJsonInfo()), so the app can say why setup failed.
@@ -1092,6 +1142,9 @@ class GlowlineUsermod : public Usermod {
     // power: only bri crossing zero counts, and it must hold for POWER_SETTLE_MS.
     void trackPower() {
       if (bootCuePhase != BootCuePhase::CUE_DONE) return;
+#ifdef GLOWLINE_IMPROV_BLE
+      if (identifyActive) return;  // the pulses are not a power change
+#endif
       bool on = bri > 0;
       if (on == powerSaved) { powerPending = false; return; }
       if (!powerPending) { powerPending = true; powerChangedAt = millis(); return; }
@@ -1908,6 +1961,114 @@ class GlowlineUsermod : public Usermod {
       return 0;
     }
 
+#ifdef GLOWLINE_IMPROV_BLE
+    // TLS waits while BLE holds ~78 KB of internal heap: with both up the largest free block stuck
+    // near 35 KB and free heap fell to 4-15 KB (LESSONS "Build, TLS, connection", BLE heap bench).
+    bool bleHoldsTls() { return GlowlineBle::active(); }
+
+    void bleStart() {
+      bleStartTried = true;
+      GlowlineBle::Identity id;
+      id.advName = String("Lumen-") + (escapedMac.c_str() + 8);  // the hotspot's name (wled.h WLED_SET_AP_SSID)
+      id.deviceId = wsDeviceId;
+      id.fwVersion = F(GLOWLINE_FW_VERSION);
+      id.passphrase = glowlineApPskGet();
+      GlowlineBle::start(id,
+                         [this](const char* ssid, const char* pass) { bleWifiReceived(ssid, pass); },
+                         [this]() { startIdentify(); });
+      mbedtls_platform_zeroize((void*)id.passphrase.c_str(), id.passphrase.length());
+    }
+
+    // The same save as WLED's serial Improv (wled00/improv.cpp parseWiFiCommand()): the first saved
+    // network, then WLED reconnects with it. The hotspot stays up meanwhile (GLOWLINE_KEEP_SETUP_AP).
+    void bleWifiReceived(const char* ssid, const char* pass) {
+      memset(multiWiFi[0].clientSSID, 0, sizeof(multiWiFi[0].clientSSID));
+      strlcpy(multiWiFi[0].clientSSID, ssid, sizeof(multiWiFi[0].clientSSID));
+      memset(multiWiFi[0].clientPass, 0, sizeof(multiWiFi[0].clientPass));
+      strlcpy(multiWiFi[0].clientPass, pass, sizeof(multiWiFi[0].clientPass));
+      forceReconnect = true;
+      serializeConfigToFS();
+      staLastReason = 0;  // only causes from this attempt count
+      bleAttemptRecentCount = staRecentCount;
+      bleAttemptAt = millis();
+      bleAttemptPending = true;
+    }
+
+    void bleTick() {
+      if (!bleStartTried) {
+        if (bleBootWindow) {
+          if (!apActive) WLED::instance().initAP(true);  // what BOOT 5-10 s does in stock WLED
+          bleBootWindowStartedAt = millis();
+          bleStart();
+        } else if (apActive && !WLED_CONNECTED) {
+          bleStart();
+        }
+      }
+      GlowlineBle::loop();
+      if (!GlowlineBle::active()) return;
+
+      if (bleBootWindow) {
+        // WLED closes the hotspot when the STA connects (wled.cpp handleConnection(), after
+        // connected()); stock BOOT 5-10 s keeps it open, so reopen it once.
+        if (WLED_CONNECTED && !apActive && !bleBootApReopened) {
+          bleBootApReopened = true;
+          WLED::instance().initAP(true);
+        }
+        if (!bleAttemptPending && bleReleaseAt == 0 && millis() - bleBootWindowStartedAt >= BLE_BOOT_WINDOW_MS) {
+          GlowlineBle::release("BOOT window over");
+          return;
+        }
+      }
+
+      if (bleAttemptPending) {
+        // Success arrives through connected(). A rejected password ends the wait at once; a network
+        // not seen yet waits for BLE_ATTEMPT_MS (scans miss now and then, see staReasonRank()).
+        uint8_t reason = staLastReason;
+        bool definite = staRecentCount != bleAttemptRecentCount && staReasonRank(reason) >= 3;
+        if (definite || millis() - bleAttemptAt >= BLE_ATTEMPT_MS) {
+          bleAttemptPending = false;
+          GlowlineBle::reportFailed(staReasonName(reason));
+        }
+      }
+
+      if (bleReleaseAt && (long)(millis() - bleReleaseAt) >= 0) {
+        bleReleaseAt = 0;
+        GlowlineBle::release("Wi-Fi connected");
+      }
+    }
+
+    // Improv "identify": the strip pulses white IDENTIFY_PULSES times (handleOverlayDraw()), then
+    // goes back to its brightness. Nothing is saved; trackPower() ignores it.
+    void startIdentify() {
+      if (identifyActive || bootCuePhase != BootCuePhase::CUE_DONE) return;  // the boot cue lights it already
+      identifyActive = true;
+      identifyStartedAt = millis();
+      identifySavedBri = bri;
+      identifySavedBriLast = briLast;
+      setBriNow(BOOT_CUE_BRI);
+    }
+
+    void tickIdentify() {
+      if (!identifyActive) return;
+      if (millis() - identifyStartedAt < 2UL * IDENTIFY_PULSES * IDENTIFY_PULSE_MS) {
+        strip.trigger();  // a static look renders rarely; the overlay needs frames
+        return;
+      }
+      identifyActive = false;
+      setBriNow(identifySavedBri);
+      briLast = identifySavedBriLast;  // stateUpdated() overwrote it with the pulse brightness
+    }
+
+    // No fade: with a zero transition WLED applies bri at once (led.cpp stateUpdated()) but leaves
+    // the transition at 0, so the default goes back right after.
+    void setBriNow(uint8_t b) {
+      bri = b;
+      strip.setTransition(0);
+      stateUpdated(CALL_MODE_NO_NOTIFY);
+      strip.setTransition(transitionDelay);
+    }
+#endif
+
   public:
     void setup() {
       // Printed unconditionally, on every boot (including the one right after a rollback) --
@@ -2010,6 +2171,21 @@ class GlowlineUsermod : public Usermod {
           prefs.end();
         }
       }
+#ifdef GLOWLINE_IMPROV_BLE
+      {
+        // Set by glowlineBleBootRequest() before its restart; read once, then cleared.
+        Preferences prefs;
+        bool flagged = prefs.begin(AP_PSK_NVS_NS, true) && prefs.getBool(BLE_BOOT_NVS_KEY, false);
+        prefs.end();
+        if (flagged) {
+          bleBootWindow = true;
+          bool cleared = prefs.begin(AP_PSK_NVS_NS, false) && prefs.remove(BLE_BOOT_NVS_KEY);
+          prefs.end();
+          Serial.printf("glowline ble: BOOT restart, Bluetooth setup and the hotspot open for %lu s%s\n",
+                        BLE_BOOT_WINDOW_MS / 1000, cleared ? "" : " (flag NVS clear FAILED, the next boot opens them too)");
+        }
+      }
+#endif
 
       if (otaRollbackReportPending && otaKnownBadVersion.length() > 0) {
         Serial.print(F("glowline ota: booted after a rollback from version "));
@@ -2033,6 +2209,15 @@ class GlowlineUsermod : public Usermod {
     // -- lets the boot cue paint raw pixels with exact timing, independent of
     // WLED's effect engine and whatever segment/effect state underlies it.
     void handleOverlayDraw() {
+#ifdef GLOWLINE_IMPROV_BLE
+      if (identifyActive) {
+        uint16_t n = strip.getLengthTotal();
+        if (n > GLOWLINE_CUE_MAX_LEDS) n = GLOWLINE_CUE_MAX_LEDS;
+        bool lit = ((millis() - identifyStartedAt) / IDENTIFY_PULSE_MS) % 2 == 0;
+        for (uint16_t i = 0; i < n; i++) strip.setPixelColor(i, lit ? RGBW32(255, 255, 255, 0) : (uint32_t)0);
+        return;
+      }
+#endif
       if (bootCuePhase == BootCuePhase::CUE_DONE) return;
       uint16_t total = strip.getLengthTotal();
       if (total > GLOWLINE_CUE_MAX_LEDS) total = GLOWLINE_CUE_MAX_LEDS; // see GLOWLINE_CUE_MAX_LEDS's comment
@@ -2072,6 +2257,10 @@ class GlowlineUsermod : public Usermod {
         Serial.printf("glowline wifi: disconnected, reason %u (%s)\n", reason, staReasonName(reason));
       }
       advanceBootCue();
+#ifdef GLOWLINE_IMPROV_BLE
+      tickIdentify();
+      bleTick();
+#endif
       trackPower();
 #ifdef GLOWLINE_SERIAL_PROVISION
       serialProvisionTick();
@@ -2135,6 +2324,9 @@ class GlowlineUsermod : public Usermod {
         if (wsState == WsState::CONNECTED || wsState == WsState::CONNECTING) onDisconnected(F("WiFi lost"), "wifi_lost");
         return;
       }
+#ifdef GLOWLINE_IMPROV_BLE
+      if (bleHoldsTls()) return;  // bleTick() releases BLE first
+#endif
 
       if (wsState == WsState::DISCONNECTED) {
         if (reconnectDue && (long)(millis() - nextAttemptAt) >= 0) {
@@ -2159,6 +2351,21 @@ class GlowlineUsermod : public Usermod {
         if (wsState == WsState::CONNECTED) checkLiveness(); // pollFrames() may have disconnected us (e.g. a close frame)
         if (wsState == WsState::CONNECTED) checkStateReport();
       }
+    }
+
+    // WLED: the STA just got an IP (wled.cpp handleConnection(), before it closes the hotspot).
+    void connected() {
+#ifdef GLOWLINE_IMPROV_BLE
+      if (!GlowlineBle::active()) return;
+      if (bleAttemptPending) {
+        bleAttemptPending = false;
+        String url = String("http://") + cmDNS + ".local/";
+        GlowlineBle::reportConnected(url.c_str());
+        bleReleaseAt = (millis() + BLE_RESULT_GRACE_MS) | 1;  // never 0 (0 = none scheduled)
+      } else if (!bleBootWindow) {
+        GlowlineBle::release("Wi-Fi connected");  // the saved network came back by itself
+      }
+#endif
     }
 
     void appendConfigData() {
@@ -2329,8 +2536,13 @@ class GlowlineUsermod : public Usermod {
       JsonObject lumen = root.createNestedObject(F("lumen"));
       lumen[F("fw")] = F(GLOWLINE_FW_VERSION);
       lumen[F("device")] = wsDeviceId;
+      JsonArray caps = lumen.createNestedArray(F("caps"));
 #ifdef GLOWLINE_SERIAL_PROVISION
-      lumen.createNestedArray(F("caps")).add(F("serial_prov")); // REQ-129: the flasher checks this before provisioning
+      caps.add(F("serial_prov")); // REQ-129: the flasher checks this before provisioning
+#endif
+#ifdef GLOWLINE_IMPROV_BLE
+      caps.add(F("improv_ble"));                 // REQ-131
+      lumen[F("ble")] = GlowlineBle::stateName(); // off, on, released
 #endif
 
       JsonObject wifi = lumen.createNestedObject(F("wifi"));
