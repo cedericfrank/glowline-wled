@@ -376,7 +376,10 @@ void loop() {
   if (sawDisconnect) {
     sawDisconnect = false;
     newBoardNonce();  // a new connection gets a new challenge
-    Serial.println(F("glowline ble: phone disconnected"));
+    // The core leaves advertising off after a disconnect unless advertiseOnDisconnect(true), which
+    // it skips under CONFIG_BT_NIMBLE_EXT_ADV (BLEServer.cpp:93, 854-859); restart it here instead.
+    BLEDevice::startAdvertising();
+    Serial.println(F("glowline ble: phone disconnected, advertising again"));
   }
   if (rxOverflow) {
     rxOverflow = false;
