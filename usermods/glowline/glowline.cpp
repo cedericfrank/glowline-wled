@@ -391,9 +391,11 @@ class GlowlineUsermod : public Usermod {
 #endif
 
 #ifdef GLOWLINE_IMPROV_BLE
-    // Wi-Fi setup over Bluetooth (glowline_ble.cpp, REQ-131). Up exactly while the setup hotspot is
-    // up, at most once per boot; released before the first TLS connect (bleHoldsTls()). After a
-    // phone sends Wi-Fi settings, BLE_ATTEMPT_MS bounds the wait for the result.
+    // Wi-Fi setup over Bluetooth (glowline_ble.cpp, REQ-131). Starts with the first setup hotspot of a
+    // boot, if the STA has not connected before it; a boot whose STA connects first gives the BLE
+    // memory back (connected()). A boot that ran BLE ends it with a restart before any TLS
+    // (bleHoldsTls(), bleRestart()): its heap stays split after deinit (REQ-131 dev bench, 41 KB
+    // largest block vs 102 KB). After a phone sends Wi-Fi settings, BLE_ATTEMPT_MS bounds the wait.
     bool bleStartTried = false;
     bool bleBootWindow = false;            // this boot came from BOOT 5-10 s (glowlineBleBootRequest())
     bool bleBootApReopened = false;        // the window's hotspot, reopened once after the STA connected
@@ -1964,7 +1966,13 @@ class GlowlineUsermod : public Usermod {
 #ifdef GLOWLINE_IMPROV_BLE
     // TLS waits while BLE holds ~78 KB of internal heap: with both up the largest free block stuck
     // near 35 KB and free heap fell to 4-15 KB (LESSONS "Build, TLS, connection", BLE heap bench).
-    bool bleHoldsTls() { return GlowlineBle::active(); }
+    bool bleHoldsTls() { return GlowlineBle::active() || GlowlineBle::released(); }
+
+    void bleRestart(const char* why) {
+      GlowlineBle::release(why);
+      Serial.println(F("glowline ble: restarting for a clean heap before TLS"));
+      doReboot = true;
+    }
 
     void bleStart() {
       bleStartTried = true;
@@ -2015,7 +2023,7 @@ class GlowlineUsermod : public Usermod {
           WLED::instance().initAP(true);
         }
         if (!bleAttemptPending && bleReleaseAt == 0 && millis() - bleBootWindowStartedAt >= BLE_BOOT_WINDOW_MS) {
-          GlowlineBle::release("BOOT window over");
+          bleRestart("BOOT window over");
           return;
         }
       }
@@ -2033,7 +2041,7 @@ class GlowlineUsermod : public Usermod {
 
       if (bleReleaseAt && (long)(millis() - bleReleaseAt) >= 0) {
         bleReleaseAt = 0;
-        GlowlineBle::release("Wi-Fi connected");
+        bleRestart("Wi-Fi connected");
       }
     }
 
@@ -2356,14 +2364,28 @@ class GlowlineUsermod : public Usermod {
     // WLED: the STA just got an IP (wled.cpp handleConnection(), before it closes the hotspot).
     void connected() {
 #ifdef GLOWLINE_IMPROV_BLE
+      if (!bleStartTried && !bleBootWindow) {
+        // Wi-Fi works before any hotspot: no BLE this boot (a later Wi-Fi loss opens the hotspot only).
+        bleStartTried = true;
+        GlowlineBle::freeMemory();
+        return;
+      }
+      if (GlowlineBle::released()) {
+        // Released earlier without a restart (too many wrong keys), then set up over the hotspot.
+        if (!doReboot) {
+          Serial.println(F("glowline ble: Wi-Fi connected after a BLE session, restarting for a clean heap"));
+          doReboot = true;
+        }
+        return;
+      }
       if (!GlowlineBle::active()) return;
       if (bleAttemptPending) {
         bleAttemptPending = false;
         String url = String("http://") + cmDNS + ".local/";
         GlowlineBle::reportConnected(url.c_str());
-        bleReleaseAt = (millis() + BLE_RESULT_GRACE_MS) | 1;  // never 0 (0 = none scheduled)
+        bleReleaseAt = (millis() + BLE_RESULT_GRACE_MS) | 1;  // never 0 (0 = none scheduled); then bleRestart()
       } else if (!bleBootWindow) {
-        GlowlineBle::release("Wi-Fi connected");  // the saved network came back by itself
+        bleRestart("Wi-Fi connected");  // the saved network came back by itself
       }
 #endif
     }

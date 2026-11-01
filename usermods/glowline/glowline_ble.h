@@ -31,6 +31,9 @@ bool released();  // was up this boot and has been released (no restart until re
 void reportConnected(const char* url);  // the Wi-Fi a phone sent is up
 void reportFailed(const char* reason);  // it didn't connect; reason as in /json/info lumen.wifi.reason
 void release(const char* why);
+// Never started this boot and not needed: hand the BLE memory the core holds back from boot
+// (initArduino(), esp32-hal-misc.c:353) to the heap. start() refuses afterwards, until a reboot.
+void freeMemory();
 const char* stateName();  // for /json/info: "off", "on", "released"
 
 }  // namespace GlowlineBle

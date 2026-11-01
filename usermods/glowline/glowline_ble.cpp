@@ -325,7 +325,7 @@ class ServerCallbacks : public BLEServerCallbacks {
 }  // namespace
 
 bool start(const Identity& id, WifiHandler onWifi, IdentifyHandler onIdentify) {
-  if (phase != Phase::OFF) return false;
+  if (phase != Phase::OFF || btMemReleased(BT_MODE_BLE)) return false;
   ident = id;
   wifiHandler = onWifi;
   identifyHandler = onIdentify;
@@ -430,6 +430,12 @@ void release(const char* why) {
   if (ident.passphrase.length()) mbedtls_platform_zeroize((void*)ident.passphrase.c_str(), ident.passphrase.length());
   ident.passphrase = "";
   logHeap("released");
+}
+
+void freeMemory() {
+  if (phase != Phase::OFF || btMemReleased(BT_MODE_BLE)) return;
+  bool ok = btMemRelease(BT_MODE_BLE);
+  logHeap(ok ? "not needed this boot, memory given back" : "memory give-back FAILED");
 }
 
 const char* stateName() {
