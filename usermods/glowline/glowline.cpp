@@ -2716,7 +2716,7 @@ class GlowlineUsermod : public Usermod {
     void burnInTick() {
       if (burnInStopPending) {
         burnInStopPending = false;
-        static const char kOff[] = "{\"on\":false}";
+        static const char kOff[] = "{\"on\":false,\"tt\":0}"; // no fade: see finishBootCue()
         applyJsonState((const uint8_t*)kOff, strlen(kOff));
       }
       if (!burnInRun || burnIn.state != GlowlineBurnIn::State::RUNNING) return;
