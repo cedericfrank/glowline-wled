@@ -14,6 +14,8 @@
 #include "mbedtls/base64.h"
 #include "mbedtls/platform_util.h"
 #include "glowline_ble.h"
+#include "glowline_burnin.h"
+#include "esp_system.h"
 
 #if __has_include(<WiFiClientSecure.h>)
   #include <WiFiClientSecure.h>
@@ -388,6 +390,20 @@ class GlowlineUsermod : public Usermod {
     unsigned long provSavingSince = 0;
     char provFp[9] = "";  // fingerprint of the passphrase just written, "" = none (open hotspot)
     static const unsigned long PROV_SAVE_TIMEOUT_MS = 4000;
+
+    // Factory burn-in (glowline_burnin.h, REQ-092). The record lives in NVS namespace "burnin" until
+    // the flasher clears it or provisioning erases it. burnInRun: this boot runs it (the strip is
+    // drawn by handleOverlayDraw(), never the boot cue); burnInShowFailed: this boot is the one after
+    // a restart that failed it (dim red until the power is cut).
+    static constexpr const char* BURNIN_NVS_NS = "burnin";
+    static const unsigned long BURNIN_MINUTE_MS = 60000;
+    static const uint8_t BURNIN_FAILED_BRI = 64;
+    GlowlineBurnIn::Record burnIn;
+    bool burnInRun = false;
+    bool burnInShowFailed = false;
+    bool burnInStopPending = false; // burnin_clear during a run: switch the strip off from loop()
+    unsigned long burnInStartedAt = 0;
+    unsigned long burnInMinuteAt = 0;
 #endif
 
 #ifdef GLOWLINE_IMPROV_BLE
@@ -1144,6 +1160,9 @@ class GlowlineUsermod : public Usermod {
     // power: only bri crossing zero counts, and it must hold for POWER_SETTLE_MS.
     void trackPower() {
       if (bootCuePhase != BootCuePhase::CUE_DONE) return;
+#ifdef GLOWLINE_SERIAL_PROVISION
+      if (burnInRun || burnInShowFailed) return; // the burn-in's full brightness is not the owner's power
+#endif
 #ifdef GLOWLINE_IMPROV_BLE
       if (identifyActive) return;  // the pulses are not a power change
 #endif
@@ -2211,12 +2230,27 @@ class GlowlineUsermod : public Usermod {
       bri = BOOT_CUE_BRI;
       offMode = false;
       bootCuePhaseStartedAt = millis();
+#ifdef GLOWLINE_SERIAL_PROVISION
+      burnInSetup(); // a burn-in power-up replaces the boot cue
+#endif
     }
 
     // Called every frame, after effects are processed but before strip.show()
     // -- lets the boot cue paint raw pixels with exact timing, independent of
     // WLED's effect engine and whatever segment/effect state underlies it.
     void handleOverlayDraw() {
+#ifdef GLOWLINE_SERIAL_PROVISION
+      if (burnInRun || burnInShowFailed) {
+        uint16_t n = strip.getLengthTotal();
+        bool passed = burnIn.state == GlowlineBurnIn::State::PASSED;
+        uint32_t ms = millis() - burnInStartedAt;
+        for (uint16_t i = 0; i < n; i++) {
+          uint32_t c = burnInShowFailed ? 0xFF0000 : GlowlineBurnIn::colourAt(ms, passed, i);
+          strip.setPixelColor(i, RGBW32((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF, 0));
+        }
+        return;
+      }
+#endif
 #ifdef GLOWLINE_IMPROV_BLE
       if (identifyActive) {
         uint16_t n = strip.getLengthTotal();
@@ -2272,6 +2306,7 @@ class GlowlineUsermod : public Usermod {
       trackPower();
 #ifdef GLOWLINE_SERIAL_PROVISION
       serialProvisionTick();
+      burnInTick();
 #endif
 
 #ifdef GLOWLINE_BENCH_ABORT_AFTER_MS
@@ -2405,7 +2440,8 @@ class GlowlineUsermod : public Usermod {
     // over the UART port, and the board writes them itself. Accepted only on a blank board (no
     // device ID, no token or passphrase in NVS, no saved Wi-Fi), which is exactly the state after a
     // full erase and flash, so a USB cable can't quietly re-point a board that is set up.
-    // Every reply is one line {"lumen":{"prov":{...}}}. The token and the passphrase are never
+    // The same port takes the factory burn-in commands (burnin_*, below; replies {"lumen":{"burnin":{...}}}).
+    // Every provisioning reply is one line {"lumen":{"prov":{...}}}. The token and the passphrase are never
     // echoed or logged: a reply carries only the device ID and the passphrase's fingerprint.
     void serialCommand(JsonObject cmd) {
       const char* name = cmd["cmd"] | "";
@@ -2415,6 +2451,12 @@ class GlowlineUsermod : public Usermod {
         else Serial.println(F("{\"lumen\":{\"prov\":{\"cmd\":\"prov_check\",\"ok\":true}}}"));
       } else if (strcmp(name, "provision") == 0) {
         provision(cmd);
+      } else if (strcmp(name, "burnin_start") == 0) {
+        burnInStart(cmd);
+      } else if (strcmp(name, "burnin_status") == 0) {
+        replyBurnIn("burnin_status");
+      } else if (strcmp(name, "burnin_clear") == 0) {
+        burnInClear();
       } else {
         Serial.println(F("{\"lumen\":{\"prov\":{\"ok\":false,\"err\":\"unknown_cmd\"}}}"));
       }
@@ -2423,6 +2465,14 @@ class GlowlineUsermod : public Usermod {
   private:
     // nullptr = the board may be provisioned; else the reply's err code.
     const char* provisionRefusal() {
+      const char* err = blankRefusal();
+      if (err) return err;
+      if (GlowlineBurnIn::blocksProvision(burnIn.state)) return "burnin"; // armed or running: clear it first
+      return nullptr;
+    }
+
+    // nullptr = the board is blank (nothing set up), as a full erase and flash leaves it.
+    const char* blankRefusal() {
       if (provState != ProvState::IDLE) return "busy";
       if (wsDeviceId.length() > 0) return "has_device";
       if (wsToken.length() > 0 || nvsHasKey(TOKEN_NVS_NS, "token")) return "has_token";
@@ -2525,6 +2575,8 @@ class GlowlineUsermod : public Usermod {
       Serial.printf("{\"lumen\":{\"prov\":{\"cmd\":\"provision\",\"ok\":true,\"device\":\"%s\",\"fp\":", wsDeviceId.c_str());
       if (provFp[0]) Serial.printf("\"%s\"}}}\n", provFp);
       else Serial.println(F("null}}}"));
+      // A provisioned board carries no burn-in record: the flasher has posted it to the factory API.
+      if (burnIn.state != GlowlineBurnIn::State::NONE && !eraseBurnIn()) Serial.println(F("glowline burnin: record NVS erase FAILED"));
       Serial.println(F("glowline prov: provisioned, rebooting"));
       Serial.flush();
       provState = ProvState::REBOOTING;
@@ -2549,6 +2601,147 @@ class GlowlineUsermod : public Usermod {
       Serial.println(F("glowline prov: cfg.json not written, provisioning undone"));
     }
 
+    // ---- Factory burn-in (glowline_burnin.h, REQ-092; contracts/firmware.md "Factory burn-in") ----
+
+    static GlowlineBurnIn::Reset burnInResetFrom(esp_reset_reason_t r) {
+      using GlowlineBurnIn::Reset;
+      switch (r) {
+        case ESP_RST_POWERON:    return Reset::POWER_CUT;
+        case ESP_RST_BROWNOUT:   return Reset::BROWNOUT;
+        case ESP_RST_PWR_GLITCH: return Reset::POWER_GLITCH;
+        case ESP_RST_PANIC:
+        case ESP_RST_CPU_LOCKUP: return Reset::CRASH;
+        case ESP_RST_INT_WDT:
+        case ESP_RST_TASK_WDT:
+        case ESP_RST_WDT:        return Reset::WATCHDOG;
+        case ESP_RST_SW:         return Reset::RESTART;
+        default:                 return Reset::OTHER;
+      }
+    }
+
+    GlowlineBurnIn::Record loadBurnIn() {
+      GlowlineBurnIn::Record r;
+      Preferences prefs;
+      if (!prefs.begin(BURNIN_NVS_NS, true)) return r; // a read-only begin() fails when never written
+      r.state = GlowlineBurnIn::stateFromByte(prefs.getUChar("st", 0));
+      r.minutes = prefs.getUShort("min", 0);
+      r.elapsed = prefs.getUShort("el", 0);
+      r.reset = GlowlineBurnIn::resetFromByte(prefs.getUChar("rs", 0));
+      prefs.end();
+      return r;
+    }
+
+    bool saveBurnIn(const GlowlineBurnIn::Record& r) {
+      Preferences prefs;
+      bool ok = prefs.begin(BURNIN_NVS_NS, false)
+             && prefs.putUChar("st", (uint8_t)r.state) == 1
+             && prefs.putUShort("min", r.minutes) == 2
+             && prefs.putUShort("el", r.elapsed) == 2
+             && prefs.putUChar("rs", (uint8_t)r.reset) == 1;
+      prefs.end();
+      return ok;
+    }
+
+    bool eraseBurnIn() {
+      Preferences prefs;
+      bool ok = prefs.begin(BURNIN_NVS_NS, false) && prefs.clear();
+      prefs.end();
+      return ok;
+    }
+
+    static void replyBurnInError(const char* cmd, const char* err) {
+      Serial.printf("{\"lumen\":{\"burnin\":{\"cmd\":\"%s\",\"ok\":false,\"err\":\"%s\"}}}\n", cmd, err);
+    }
+
+    // The record plus what the strip runs with now: LED count, the whole-strip limit (0 = off) and
+    // the first output's mA per LED (0 = the limiter can't estimate, so it is off too).
+    void replyBurnIn(const char* cmd) {
+      const char* why = GlowlineBurnIn::resetName(burnIn.reset);
+      const Bus* bus = BusManager::getBus(0);
+      Serial.printf("{\"lumen\":{\"burnin\":{\"cmd\":\"%s\",\"ok\":true,\"state\":\"%s\",\"min\":%u,\"elapsed\":%u,\"reset\":",
+                    cmd, GlowlineBurnIn::stateName(burnIn.state), (unsigned)burnIn.minutes, (unsigned)burnIn.elapsed);
+      if (why) Serial.printf("\"%s\"", why);
+      else Serial.print(F("null"));
+      Serial.printf(",\"leds\":%u,\"maxpwr\":%u,\"ledma\":%u}}}\n", (unsigned)strip.getLengthTotal(),
+                    (unsigned)BusManager::ablMilliampsMax(), bus ? (unsigned)bus->getLEDCurrent() : 0u);
+    }
+
+    // Arms the burn-in for the next power-up. Only on a blank board, like provisioning; arming an
+    // armed board again replaces its minutes. "min" defaults to 30 when left out.
+    void burnInStart(JsonObject cmd) {
+      JsonVariant mv = cmd["min"];
+      long minutes = mv.isNull() ? 30 : (mv.is<long>() ? mv.as<long>() : -1);
+      const char* err = blankRefusal();
+      if (!err) err = GlowlineBurnIn::armRefusal(true, burnIn.state, minutes);
+      if (err) return replyBurnInError("burnin_start", err);
+      GlowlineBurnIn::Record r;
+      r.state = GlowlineBurnIn::State::ARMED;
+      r.minutes = (uint16_t)minutes;
+      if (!saveBurnIn(r)) return replyBurnInError("burnin_start", "nvs_failed");
+      burnIn = r;
+      stopBurnInShow();
+      replyBurnIn("burnin_start");
+      Serial.printf("glowline burnin: armed for %ld min, runs at the next power-up (barrel jack, USB unplugged)\n", minutes);
+    }
+
+    // Forgets the record (the flasher has posted it). During a run it also stops the load.
+    void burnInClear() {
+      if (!eraseBurnIn()) return replyBurnInError("burnin_clear", "nvs_failed");
+      burnIn = GlowlineBurnIn::Record();
+      stopBurnInShow();
+      replyBurnIn("burnin_clear");
+      Serial.println(F("glowline burnin: cleared"));
+    }
+
+    // Ends this boot's burn-in drawing, if any (a run that passed, or the failure in red).
+    void stopBurnInShow() {
+      if (!burnInRun && !burnInShowFailed) return;
+      burnInRun = burnInShowFailed = false;
+      burnInStopPending = true; // called with the JSON buffer locked; loop() switches the strip off
+    }
+
+    // From setup(): what this power-up does with the stored record (GlowlineBurnIn::onBoot()).
+    void burnInSetup() {
+      using namespace GlowlineBurnIn;
+      Record stored = loadBurnIn();
+      if (stored.state == State::NONE) return;
+      esp_reset_reason_t raw = esp_reset_reason();
+      Boot b = onBoot(stored, burnInResetFrom(raw));
+      if (b.changed && !saveBurnIn(b.rec)) {
+        // Not run: a restart during it would go unrecorded. The record stays as it was.
+        Serial.println(F("glowline burnin: NVS write FAILED, not run"));
+        burnIn = stored;
+        return;
+      }
+      burnIn = b.rec;
+      const char* why = GlowlineBurnIn::resetName(burnInResetFrom(raw));
+      Serial.printf("glowline burnin: %s, %u of %u min (reset reason %d %s)\n", GlowlineBurnIn::stateName(burnIn.state),
+                    (unsigned)burnIn.elapsed, (unsigned)burnIn.minutes, (int)raw, why ? why : "");
+      if (!b.run && !b.failed) return;
+      burnInRun = b.run;
+      burnInShowFailed = b.failed;
+      bootCuePhase = BootCuePhase::CUE_DONE; // the burn-in draws the strip (handleOverlayDraw()), not the boot cue
+      bri = b.run ? 255 : BURNIN_FAILED_BRI; // the brightness limiter scales this down
+      offMode = false;
+      burnInStartedAt = burnInMinuteAt = millis();
+    }
+
+    // From loop(): counts whole minutes of a run and saves each one.
+    void burnInTick() {
+      if (burnInStopPending) {
+        burnInStopPending = false;
+        static const char kOff[] = "{\"on\":false}";
+        applyJsonState((const uint8_t*)kOff, strlen(kOff));
+      }
+      if (!burnInRun || burnIn.state != GlowlineBurnIn::State::RUNNING) return;
+      if (millis() - burnInMinuteAt < BURNIN_MINUTE_MS) return;
+      burnInMinuteAt += BURNIN_MINUTE_MS;
+      burnIn = GlowlineBurnIn::onMinute(burnIn);
+      bool saved = saveBurnIn(burnIn);
+      Serial.printf("glowline burnin: %u of %u min%s%s\n", (unsigned)burnIn.elapsed, (unsigned)burnIn.minutes,
+                    burnIn.state == GlowlineBurnIn::State::PASSED ? ", passed" : "", saved ? "" : " (NVS write FAILED)");
+    }
+
   public:
 #endif
 
@@ -2561,6 +2754,7 @@ class GlowlineUsermod : public Usermod {
       JsonArray caps = lumen.createNestedArray(F("caps"));
 #ifdef GLOWLINE_SERIAL_PROVISION
       caps.add(F("serial_prov")); // REQ-129: the flasher checks this before provisioning
+      caps.add(F("burnin"));      // REQ-092: burnin_start/_status/_clear over serial
 #endif
 #ifdef GLOWLINE_IMPROV_BLE
       caps.add(F("improv_ble"));                 // REQ-131
