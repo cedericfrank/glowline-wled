@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Bench check of the factory burn-in (REQ-092) before the browser flasher has its step.
+
+Sends one burn-in command over the board's UART port (WLED's serial JSON, a {"lumen":{...}} line)
+and prints the board's answer, plus any "glowline burnin:" log lines it prints meanwhile.
+
+  ~/.platformio/penv/bin/python tools/burnin-bench --port PORT status
+  ~/.platformio/penv/bin/python tools/burnin-bench --port PORT start --min 2
+  ~/.platformio/penv/bin/python tools/burnin-bench --port PORT clear
+
+On a Mac, opening the port restarts the board: the command is resent every second until it answers.
+After `start`, don't run the script again: unplug USB within a minute, then plug in the barrel jack
+(a restart after `start` already counts as the burn-in's power-up; only a power cut in its first
+minute is forgiven).
+"""
+import argparse
+import json
+import sys
+import time
+
+import serial
+
+TIMEOUT_S = 25
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Send one factory burn-in command over serial.")
+    ap.add_argument("--port", required=True, help="the board's UART port, e.g. /dev/cu.usbmodem5CF80510771")
+    ap.add_argument("command", choices=["status", "start", "clear"])
+    ap.add_argument("--min", type=int, default=None, help="start only: minutes (1-240, default 30)")
+    args = ap.parse_args()
+
+    cmd = {"cmd": "burnin_" + args.command}
+    if args.command == "start" and args.min is not None:
+        cmd["min"] = args.min
+    line_out = json.dumps({"lumen": cmd}, separators=(",", ":")).encode() + b"\n"
+
+    s = serial.Serial()
+    s.port = args.port
+    s.baudrate = 115200
+    s.timeout = 0.2
+    s.dtr = False  # leave EN and IO0 alone
+    s.rts = False
+    s.open()
+    buf = b""
+    deadline = time.monotonic() + TIMEOUT_S
+    next_send = 0.0
+    try:
+        while time.monotonic() < deadline:
+            if time.monotonic() >= next_send:
+                s.write(line_out)
+                next_send = time.monotonic() + 1.0
+            buf += s.read(4096)
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                text = raw.decode(errors="replace").strip()
+                if text.startswith("glowline burnin:") or text.startswith("glowline prov:"):
+                    print("  log: " + text)
+                if not text.startswith('{"lumen":'):
+                    continue
+                try:
+                    reply = json.loads(text)["lumen"]
+                except (ValueError, KeyError):
+                    continue
+                print(json.dumps(reply, indent=1))
+                body = reply.get("burnin") or reply.get("prov") or {}
+                return 0 if body.get("ok") else 1
+    finally:
+        s.close()
+    print(f"no answer within {TIMEOUT_S} s: is this the board's UART port, and does it run 1.16.0 or later?")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
