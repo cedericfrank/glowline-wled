@@ -15,6 +15,7 @@
 #include "mbedtls/platform_util.h"
 #include "glowline_ble.h"
 #include "glowline_burnin.h"
+#include "glowline_cue.h"
 #include "esp_system.h"
 
 #if __has_include(<WiFiClientSecure.h>)
@@ -337,20 +338,15 @@ class GlowlineUsermod : public Usermod {
     // pixel writes every frame, right before strip.show()) rather than
     // through WLED's effect engine, since effects have no precise
     // speed-to-duration mapping and this needs exact timing.
-    //   1. Fill (white) from the first to the last LED over 1s.
-    //   2. Hold fully lit (white) while waiting for a WiFi connection.
-    //   3. WiFi connects  -> solid green for 1s, then off.
-    //      WiFi times out -> solid red for 5s, then off.
+    // Phases, timings and colours: glowline_cue.h (REQ-140): dark 1 s, white fill fading in, then
+    // orange (no Wi-Fi saved), green (connected) or red (saved Wi-Fi didn't connect), then off.
     // Runs once per physical boot (driven by setup(), not by config saves),
-    // at a fixed 50% brightness throughout.
-    enum class BootCuePhase : uint8_t { CUE_FILL, CUE_WAIT_WIFI, CUE_GREEN, CUE_RED, CUE_DONE };
+    // at a fixed 50% brightness throughout, and ends with no fade (finishBootCue()).
+    using BootCuePhase = GlowlineCue::Phase;
     static const uint8_t BOOT_CUE_BRI = 128; // 50%
-    static const unsigned long BOOT_CUE_FILL_MS = 1000;
-    static const unsigned long BOOT_CUE_WIFI_WAIT_MS = 10000; // budget after the fill before declaring failure
-    static const unsigned long BOOT_CUE_GREEN_MS = 1000;
-    static const unsigned long BOOT_CUE_RED_MS = 5000;
-    BootCuePhase bootCuePhase = BootCuePhase::CUE_FILL;
+    BootCuePhase bootCuePhase = BootCuePhase::CUE_SETTLE;
     unsigned long bootCuePhaseStartedAt = 0;
+    unsigned long bootCueFillStartedAt = 0; // the white's fade-in counts from here
     bool serverPushedDuringCue = false; // the cue then ends on the pushed state, not the saved view
 
     // Last view (REQ-030/REQ-032): the strip comes back after a reboot showing its last view, parts
@@ -710,7 +706,7 @@ class GlowlineUsermod : public Usermod {
       Serial.println(ESP.getFreeHeap());
 
       String target = String("/ws?device=") + urlEncode(wsDeviceId) + "&fw=" + urlEncode(String(F(GLOWLINE_FW_VERSION)))
-                      + "&caps=heartbeat,probe,ack,rotate,state";
+                      + "&caps=heartbeat,probe,ack,rotate,state" + "&rst=" + resetReasonName();
       Serial.print(F("glowline ws: GET "));
       Serial.print(target);
       Serial.println(F(" (token in the Authorization header)"));
@@ -1088,7 +1084,9 @@ class GlowlineUsermod : public Usermod {
         return;
       }
       if (restoreView()) return;
-      static const char kOff[] = "{\"on\":false}";
+      // "tt":0: no fade. A fade would show WLED's own state under the cue (its default orange, at the
+      // cue's brightness) while the overlay no longer draws: the orange seen on connect (REQ-140).
+      static const char kOff[] = "{\"on\":false,\"tt\":0}";
       applyJsonState((const uint8_t*)kOff, strlen(kOff));
     }
 
@@ -1149,6 +1147,7 @@ class GlowlineUsermod : public Usermod {
         return false;
       }
       root["on"] = powerSaved;
+      root["tt"] = 0; // straight from the cue to the view, no fade through WLED's state (finishBootCue())
       deserializeState(root);
       releaseJSONBufferLock();
       Serial.printf("glowline view: restored saved view, %u segments, power %s\n",
@@ -1188,36 +1187,41 @@ class GlowlineUsermod : public Usermod {
     // Advances the boot cue's phase based on elapsed time and WiFi state.
     // Call once per loop() tick; the actual pixel painting happens in
     // handleOverlayDraw() so it stays exactly in sync with what's shown.
+    // Why this boot started, from the chip (esp_reset_reason()): "brownout" after the supply sagged
+    // (a 5 V brick hit with a step load), "power_on" after a plug-in, "crash" / "watchdog" after a
+    // fault, "restart" after the firmware's own restart (setup done, OTA, BLE session). REQ-140.
+    static const char* resetReasonName() {
+      switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:    return "power_on";
+        case ESP_RST_BROWNOUT:   return "brownout";
+        case ESP_RST_PWR_GLITCH: return "power_glitch";
+        case ESP_RST_PANIC:
+        case ESP_RST_CPU_LOCKUP: return "crash";
+        case ESP_RST_INT_WDT:
+        case ESP_RST_TASK_WDT:
+        case ESP_RST_WDT:        return "watchdog";
+        case ESP_RST_SW:         return "restart";
+        case ESP_RST_DEEPSLEEP:  return "deep_sleep";
+        case ESP_RST_EXT:        return "external";
+        default:                 return "other";
+      }
+    }
+
     void advanceBootCue() {
       if (bootCuePhase == BootCuePhase::CUE_DONE) return;
-      unsigned long elapsed = millis() - bootCuePhaseStartedAt;
-      switch (bootCuePhase) {
-        case BootCuePhase::CUE_FILL:
-          if (elapsed >= BOOT_CUE_FILL_MS) {
-            bootCuePhase = BootCuePhase::CUE_WAIT_WIFI;
-            bootCuePhaseStartedAt = millis();
-          }
-          break;
-        case BootCuePhase::CUE_WAIT_WIFI:
-          if (WLED_CONNECTED) {
-            Serial.println(F("glowline: boot cue -- WiFi connected"));
-            bootCuePhase = BootCuePhase::CUE_GREEN;
-            bootCuePhaseStartedAt = millis();
-          } else if (elapsed >= BOOT_CUE_WIFI_WAIT_MS) {
-            Serial.println(F("glowline: boot cue -- WiFi did not connect in time"));
-            bootCuePhase = BootCuePhase::CUE_RED;
-            bootCuePhaseStartedAt = millis();
-          }
-          break;
-        case BootCuePhase::CUE_GREEN:
-          if (elapsed >= BOOT_CUE_GREEN_MS) finishBootCue();
-          break;
-        case BootCuePhase::CUE_RED:
-          if (elapsed >= BOOT_CUE_RED_MS) finishBootCue();
-          break;
-        case BootCuePhase::CUE_DONE:
-          break;
+      bool saved = WLED_WIFI_CONFIGURED;
+      BootCuePhase next = GlowlineCue::next(bootCuePhase, millis() - bootCuePhaseStartedAt, saved, WLED_CONNECTED);
+      if (next == bootCuePhase) return;
+      switch (next) {
+        case BootCuePhase::CUE_FILL:      bootCueFillStartedAt = millis(); break;
+        case BootCuePhase::CUE_ORANGE:    Serial.println(F("glowline: boot cue -- no WiFi saved, waiting for setup")); break;
+        case BootCuePhase::CUE_GREEN:     Serial.println(F("glowline: boot cue -- WiFi connected")); break;
+        case BootCuePhase::CUE_RED:       Serial.println(F("glowline: boot cue -- WiFi did not connect in time")); break;
+        case BootCuePhase::CUE_DONE:      finishBootCue(); return;
+        default: break;
       }
+      bootCuePhase = next;
+      bootCuePhaseStartedAt = millis();
     }
 
     // ---- OTA update helpers (docs/OTA.md Section 5) ----
@@ -2263,30 +2267,12 @@ class GlowlineUsermod : public Usermod {
       if (bootCuePhase == BootCuePhase::CUE_DONE) return;
       uint16_t total = strip.getLengthTotal();
       if (total > GLOWLINE_CUE_MAX_LEDS) total = GLOWLINE_CUE_MAX_LEDS; // see GLOWLINE_CUE_MAX_LEDS's comment
-      uint32_t color;
-      uint16_t lit = total;
-      switch (bootCuePhase) {
-        case BootCuePhase::CUE_FILL: {
-          unsigned long elapsed = millis() - bootCuePhaseStartedAt;
-          uint32_t filled = ((uint32_t)total * (elapsed < BOOT_CUE_FILL_MS ? elapsed : BOOT_CUE_FILL_MS)) / BOOT_CUE_FILL_MS;
-          lit = (uint16_t)filled;
-          color = RGBW32(255, 255, 255, 0);
-          break;
-        }
-        case BootCuePhase::CUE_WAIT_WIFI:
-          color = RGBW32(255, 255, 255, 0);
-          break;
-        case BootCuePhase::CUE_GREEN:
-          color = RGBW32(0, 255, 0, 0);
-          break;
-        case BootCuePhase::CUE_RED:
-          color = RGBW32(255, 0, 0, 0);
-          break;
-        default:
-          return;
-      }
+      unsigned long now = millis();
+      uint32_t inPhase = now - bootCuePhaseStartedAt;
+      uint32_t sinceFill = bootCuePhase == BootCuePhase::CUE_SETTLE ? 0 : now - bootCueFillStartedAt;
       for (uint16_t i = 0; i < total; i++) {
-        strip.setPixelColor(i, i < lit ? color : (uint32_t)0);
+        uint32_t c = GlowlineCue::colourAt(bootCuePhase, inPhase, sinceFill, i, total);
+        strip.setPixelColor(i, RGBW32((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF, 0));
       }
     }
 
@@ -2751,6 +2737,7 @@ class GlowlineUsermod : public Usermod {
       JsonObject lumen = root.createNestedObject(F("lumen"));
       lumen[F("fw")] = F(GLOWLINE_FW_VERSION);
       lumen[F("device")] = wsDeviceId;
+      lumen[F("reset")] = resetReasonName(); // why this boot started (REQ-140; also &rst= on /ws)
       JsonArray caps = lumen.createNestedArray(F("caps"));
 #ifdef GLOWLINE_SERIAL_PROVISION
       caps.add(F("serial_prov")); // REQ-129: the flasher checks this before provisioning

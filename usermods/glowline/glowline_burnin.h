@@ -8,9 +8,11 @@
 // NVS until the page reads it and clears it (or provisioning erases it).
 //
 // Pure logic only (no Arduino, no NVS), so it is tested on the host:
-// usermods/glowline/test/burnin_test.cpp, run by tools/glowline-burnin.test.mjs (npm test).
+// usermods/glowline/test/burnin_test.cpp, run by tools/glowline-host.test.mjs (npm test).
 
 #include <stdint.h>
+
+#include "glowline_cue.h" // the same gentle start as the boot cue
 
 namespace GlowlineBurnIn {
 
@@ -20,7 +22,7 @@ enum class State : uint8_t { NONE = 0, ARMED = 1, RUNNING = 2, PASSED = 3, FAILE
 enum class Reset : uint8_t { NONE = 0, POWER_CUT, BROWNOUT, POWER_GLITCH, CRASH, WATCHDOG, RESTART, OTHER };
 
 static const uint16_t MAX_MINUTES = 240;
-static const uint32_t COLOUR_STEP_MS = 3000; // red, green, blue, white: 3 s each at the start
+static const uint32_t COLOUR_STEP_MS = 3000; // red, green, blue, white: 3 s each, after 1 s dark
 static const uint16_t DONE_MARK_LEDS = 10;   // green at the start of the strip once it has passed
 
 struct Record {
@@ -79,10 +81,14 @@ inline const char* armRefusal(bool blank, State current, long minutes) {
 // (shippable) board can never start one at its owner's first power-up.
 inline bool blocksProvision(State s) { return s == State::ARMED || s == State::RUNNING; }
 
-// Colour (0xRRGGBB) of LED i, ms after the run started; the limiter scales it down.
+// Colour (0xRRGGBB) of LED i, ms after the run started; the limiter scales it down. Dark for the
+// cue's settle time, then the colours fade in as the boot cue's white does (REQ-140): a full-strip
+// step load right at power-up can brown out a good board on its own brick and fail it in minute 0.
 inline uint32_t colourAt(uint32_t ms, bool passed, uint16_t i) {
   static const uint32_t steps[4] = {0xFF0000, 0x00FF00, 0x0000FF, 0xFFFFFF};
-  if (ms < 4 * COLOUR_STEP_MS) return steps[ms / COLOUR_STEP_MS];
+  if (ms < GlowlineCue::SETTLE_MS) return 0;
+  uint32_t t = ms - GlowlineCue::SETTLE_MS;
+  if (t < 4 * COLOUR_STEP_MS) return GlowlineCue::scaled(steps[t / COLOUR_STEP_MS], GlowlineCue::fadeIn(t));
   if (passed && i < DONE_MARK_LEDS) return 0x00FF00;
   return 0xFFFFFF;
 }

@@ -1,5 +1,5 @@
 // Host test for the factory burn-in logic (glowline_burnin.h, REQ-092). No Arduino: built with the
-// host compiler by tools/glowline-burnin.test.mjs, which `npm test` (and Lumen CI) runs.
+// host compiler by tools/glowline-host.test.mjs, which `npm test` (and Lumen CI) runs.
 #include "../glowline_burnin.h"
 
 #include <cstdio>
@@ -110,13 +110,18 @@ static void provisioningWaitsForAPendingOrRunningBurnIn() {
   CHECK(!blocksProvision(State::FAILED));
 }
 
-static void coloursThenWhiteThenDoneMark() {
-  CHECK(colourAt(0, false, 0) == 0xFF0000);
-  CHECK(colourAt(COLOUR_STEP_MS - 1, false, 479) == 0xFF0000);
-  CHECK(colourAt(COLOUR_STEP_MS, false, 0) == 0x00FF00);
-  CHECK(colourAt(2 * COLOUR_STEP_MS, false, 0) == 0x0000FF);
-  CHECK(colourAt(3 * COLOUR_STEP_MS, false, 0) == 0xFFFFFF);
-  CHECK(colourAt(4 * COLOUR_STEP_MS, false, 0) == 0xFFFFFF);
+static void darkThenColoursFadeInThenWhiteThenDoneMark() {
+  const uint32_t S = GlowlineCue::SETTLE_MS;
+  CHECK(colourAt(0, false, 0) == 0);                 // dark while the brick settles
+  CHECK(colourAt(S - 1, false, 0) == 0);
+  CHECK(colourAt(S, false, 0) == 0);                 // red, faded in from 0
+  CHECK(colourAt(S + GlowlineCue::FADE_MS / 2, false, 0) == 0x7F0000);
+  CHECK(colourAt(S + GlowlineCue::FADE_MS, false, 479) == 0xFF0000);
+  CHECK(colourAt(S + COLOUR_STEP_MS - 1, false, 0) == 0xFF0000);
+  CHECK(colourAt(S + COLOUR_STEP_MS, false, 0) == 0x00FF00);
+  CHECK(colourAt(S + 2 * COLOUR_STEP_MS, false, 0) == 0x0000FF);
+  CHECK(colourAt(S + 3 * COLOUR_STEP_MS, false, 0) == 0xFFFFFF);
+  CHECK(colourAt(S + 4 * COLOUR_STEP_MS, false, 0) == 0xFFFFFF);
   CHECK(colourAt(30u * 60u * 1000u, true, 0) == 0x00FF00);
   CHECK(colourAt(30u * 60u * 1000u, true, DONE_MARK_LEDS - 1) == 0x00FF00);
   CHECK(colourAt(30u * 60u * 1000u, true, DONE_MARK_LEDS) == 0xFFFFFF); // the load stays on
@@ -152,7 +157,7 @@ int main() {
   resultBootsAreNormalAndKeepTheResult();
   armingRules();
   provisioningWaitsForAPendingOrRunningBurnIn();
-  coloursThenWhiteThenDoneMark();
+  darkThenColoursFadeInThenWhiteThenDoneMark();
   namesAndStoredBytes();
   if (failures) {
     std::printf("%d check(s) failed\n", failures);
