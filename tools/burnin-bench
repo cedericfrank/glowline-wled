@@ -7,6 +7,7 @@ and prints the board's answer, plus any "glowline burnin:" log lines it prints m
   ~/.platformio/penv/bin/python tools/burnin-bench --port PORT status
   ~/.platformio/penv/bin/python tools/burnin-bench --port PORT start --min 2
   ~/.platformio/penv/bin/python tools/burnin-bench --port PORT clear
+  ~/.platformio/penv/bin/python tools/burnin-bench --port PORT prov_check   (err "burnin" while armed)
 
 On a Mac, opening the port restarts the board: the command is resent every second until it answers.
 After `start`, don't run the script again: unplug USB within a minute, then plug in the barrel jack
@@ -26,11 +27,11 @@ TIMEOUT_S = 25
 def main():
     ap = argparse.ArgumentParser(description="Send one factory burn-in command over serial.")
     ap.add_argument("--port", required=True, help="the board's UART port, e.g. /dev/cu.usbmodem5CF80510771")
-    ap.add_argument("command", choices=["status", "start", "clear"])
+    ap.add_argument("command", choices=["status", "start", "clear", "prov_check"])
     ap.add_argument("--min", type=int, default=None, help="start only: minutes (1-240, default 30)")
     args = ap.parse_args()
 
-    cmd = {"cmd": "burnin_" + args.command}
+    cmd = {"cmd": args.command if args.command == "prov_check" else "burnin_" + args.command}
     if args.command == "start" and args.min is not None:
         cmd["min"] = args.min
     line_out = json.dumps({"lumen": cmd}, separators=(",", ":")).encode() + b"\n"
