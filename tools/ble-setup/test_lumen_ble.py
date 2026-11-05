@@ -100,6 +100,13 @@ class Packets(unittest.TestCase):
         body = bytes([0x03, len(data)]) + data
         self.assertEqual(lb.parse_result(body + bytes([sum(body) & 0xFF])), (0x03, strings))
 
+    def test_networks(self):
+        self.assertEqual(lb.parse_networks(["Home", "-50", "WPA2", "Cafe", "-80", "NO"]),
+                         [("Home", -50, "WPA2"), ("Cafe", -80, "NO")])
+        self.assertEqual(lb.parse_networks([]), [])
+        with self.assertRaises(ValueError):
+            lb.parse_networks(["Home", "-50"])
+
     def test_result_bad_checksum(self):
         body = bytes([0x81, 1, 0])
         with self.assertRaises(ValueError):

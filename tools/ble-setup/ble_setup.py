@@ -9,6 +9,7 @@
   python ble_setup.py wifi Lumen-xxxx --ssid "Home"            # encrypted; asks for both secrets
   python ble_setup.py wifi Lumen-xxxx --ssid "Home" --plain    # plain Improv (refused with a passphrase)
   python ble_setup.py status Lumen-xxxx
+  python ble_setup.py networks Lumen-xxxx                      # the Wi-Fi list the board sees (1.18.0+)
 
 The Wi-Fi password and the hotspot passphrase are read at a hidden prompt, never from the command
 line, and never printed. See readme.md.
@@ -104,6 +105,17 @@ async def cmd_identify(args):
     await with_board(args, run)
 
 
+async def cmd_networks(args):
+    async def run(board):
+        t0 = asyncio.get_running_loop().time()
+        nets = lb.parse_networks(await board.rpc(lb.CMD_SCAN, timeout=20.0))
+        took = asyncio.get_running_loop().time() - t0
+        print(f"{len(nets)} network(s) in {took:.1f} s, strongest first:" if nets else f"no network found ({took:.1f} s)")
+        for ssid, rssi, auth in nets:
+            print(f"  {rssi:4} dBm  {auth:10}  {ssid}")
+    await with_board(args, run)
+
+
 async def cmd_status(args):
     async def run(board):
         state, detail = (await board.rpc(lb.CMD_LUMEN_STATUS) + ["", ""])[:2]
@@ -156,7 +168,7 @@ def main():
     p.add_argument("--timeout", type=float, default=10.0, help="scan time in seconds")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("scan")
-    for c in ("info", "identify", "status"):
+    for c in ("info", "identify", "status", "networks"):
         sub.add_parser(c).add_argument("name", help="Lumen-xxxx")
     w = sub.add_parser("wifi")
     w.add_argument("name", help="Lumen-xxxx")
@@ -164,7 +176,8 @@ def main():
     w.add_argument("--device", help="refuse unless the board reports this device ID")
     w.add_argument("--plain", action="store_true", help="plain Improv 0x01 (no encryption)")
     args = p.parse_args()
-    fn = {"scan": cmd_scan, "info": cmd_info, "identify": cmd_identify, "status": cmd_status, "wifi": cmd_wifi}[args.cmd]
+    fn = {"scan": cmd_scan, "info": cmd_info, "identify": cmd_identify, "status": cmd_status, "networks": cmd_networks,
+          "wifi": cmd_wifi}[args.cmd]
     asyncio.run(fn(args))
 
 

@@ -32,6 +32,10 @@ next restart.
    - It ends with `online` and the board's address, or with the reason it failed (for example
      `wrong_password` or `network_not_found`).
 5. Ask a board what happened to the last Wi-Fi it was sent: `.venv/bin/python ble_setup.py status Lumen-xxxx`
+   Before any Wi-Fi is sent (firmware 1.18.0+), it says why the saved network fails, for example
+   `failed: wrong_password`.
+6. List the Wi-Fi networks the board sees (firmware 1.18.0+): `.venv/bin/python ble_setup.py networks Lumen-xxxx`
+   Strongest first, with each one's signal and security, and how long the scan took.
 
 `--plain` sends the Wi-Fi settings unencrypted, as a generic Improv app would. A board with a
 hotspot passphrase must refuse it (`not authorized`); that refusal is one of the bench checks.

@@ -22,6 +22,7 @@ SERVICE_DATA_UUID = "00004677-0000-1000-8000-00805f9b34fb"
 CMD_WIFI = 0x01
 CMD_IDENTIFY = 0x02
 CMD_DEVICE_INFO = 0x03
+CMD_SCAN = 0x04
 CMD_LUMEN_WIFI = 0x80
 CMD_LUMEN_CHALLENGE = 0x81
 CMD_LUMEN_STATUS = 0x82
@@ -64,6 +65,13 @@ def parse_result(packet: bytes):
         strings.append(data[i + 1:i + 1 + n].decode("utf-8"))
         i += 1 + n
     return packet[0], strings
+
+
+def parse_networks(strings):
+    """An Improv 0x04 result's strings as [(ssid, rssi, security)]; no strings = no network found."""
+    if len(strings) % 3:
+        raise ValueError("Wi-Fi list is not a multiple of 3 strings")
+    return [(strings[i], int(strings[i + 1]), strings[i + 2]) for i in range(0, len(strings), 3)]
 
 
 def wifi_data(ssid: str, password: str) -> bytes:
