@@ -986,6 +986,11 @@ void WLED::initInterfaces()
   wasConnected = true;
 }
 
+#ifdef GLOWLINE_IMPROV_BLE
+bool glowlineBlePhoneConnected(); // usermods/glowline/glowline.cpp (REQ-135)
+bool glowlineBleKeepAp();
+#endif
+
 void WLED::handleConnection()
 {
   static bool scanDone = true;
@@ -1019,6 +1024,9 @@ void WLED::handleConnection()
     wifi_sta_list_t stationList;
     esp_wifi_ap_get_sta_list(&stationList);
     stac = stationList.num;
+#endif
+#ifdef GLOWLINE_IMPROV_BLE
+    if (glowlineBlePhoneConnected()) stac++; // glowline: a phone on Bluetooth pauses the STA's retries too (REQ-135)
 #endif
     if (stac != stacO) {
       stacO = stac;
@@ -1118,7 +1126,12 @@ void WLED::handleConnection()
     lastMqttReconnectAttempt = 0; // force immediate update
 
     // shut down AP
+#ifdef GLOWLINE_IMPROV_BLE
+    // glowline: not while Bluetooth is up -- no radio mode switch under a phone's link (REQ-135)
+    if (apBehavior != AP_BEHAVIOR_ALWAYS && apActive && !glowlineBleKeepAp()) {
+#else
     if (apBehavior != AP_BEHAVIOR_ALWAYS && apActive) {
+#endif
       dnsServer.stop();
       WiFi.softAPdisconnect(true);
       apActive = false;

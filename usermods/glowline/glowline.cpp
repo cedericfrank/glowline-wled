@@ -16,6 +16,10 @@
 #include "glowline_ble.h"
 #include "glowline_burnin.h"
 #include "glowline_cue.h"
+#include "glowline_scan.h"
+#include "glowline_wrongpw.h"
+#include <memory>
+#include <new>
 #include "esp_system.h"
 
 #if __has_include(<WiFiClientSecure.h>)
@@ -284,6 +288,20 @@ void glowlineBleBootRequest() {
   Serial.println(F("glowline ble: BOOT held, restarting with Bluetooth setup and the hotspot on"));
   doReboot = true;
 }
+
+// Hooks in WLED::handleConnection() (wled00/wled.cpp), REQ-135 item 3.
+// A phone on Bluetooth counts as a hotspot client: WLED stops the STA's retries meanwhile, as it does for
+// a phone on the hotspot, so they don't keep taking the radio from the Bluetooth link.
+bool glowlineBlePhoneConnected() { return GlowlineBle::phoneConnected(); }
+// While Bluetooth is up the hotspot stays up when the STA connects: no radio mode switch under a phone's
+// link (the board restarts when its Bluetooth session ends anyway).
+bool glowlineBleKeepAp() { return GlowlineBle::active(); }
+
+// Set right before the restart into setup mode after a rejected password (REQ-135); survives that
+// restart but not a power cut, and is cleared once the board reaches its server: at most one such
+// restart until then, so a password that keeps failing can never become a restart loop.
+static constexpr uint32_t WRONG_PW_RESTART_MAGIC = 0x57505231;  // "WPR1"
+RTC_NOINIT_ATTR static uint32_t glowlineWrongPwRestart;
 #endif
 
 /*
@@ -410,18 +428,25 @@ class GlowlineUsermod : public Usermod {
     // largest block vs 102 KB). After a phone sends Wi-Fi settings, BLE_ATTEMPT_MS bounds the wait.
     bool bleStartTried = false;
     bool bleBootWindow = false;            // this boot came from BOOT 5-10 s (glowlineBleBootRequest())
-    bool bleBootApReopened = false;        // the window's hotspot, reopened once after the STA connected
     unsigned long bleBootWindowStartedAt = 0;
     bool bleAttemptPending = false;        // Wi-Fi settings from a phone, result not reported yet
     unsigned long bleAttemptAt = 0;
     uint8_t bleAttemptRecentCount = 0;     // staRecentCount when the attempt started
     unsigned long bleReleaseAt = 0;        // 0 = no release scheduled
+    bool bleScanPending = false;           // a phone asked for the Wi-Fi list (Improv 0x04), not answered yet
+    unsigned long bleScanAskedAt = 0;
+    unsigned long bleScanTriedAt = 0;
+    GlowlineWrongPw::Watch wrongPwWatch;   // back to setup mode after a rejected password (REQ-135)
     bool identifyActive = false;
     unsigned long identifyStartedAt = 0;
     uint8_t identifySavedBri = 0, identifySavedBriLast = 0;
     static const unsigned long BLE_BOOT_WINDOW_MS = 5UL * 60UL * 1000UL;
     static const unsigned long BLE_ATTEMPT_MS = 30000;
     static const unsigned long BLE_RESULT_GRACE_MS = 3000;  // the phone reads the result before BLE goes
+    static const unsigned long BLE_SCAN_TIMEOUT_MS = 15000;  // then error 0xFF, the phone asks again
+    static const unsigned long BLE_SCAN_RETRY_MS = 1000;     // a scan the driver refused (STA busy) is retried
+    static const uint32_t BLE_SCAN_MS_PER_CHANNEL = 120;     // ~1.6 s over 13 channels; the hotspot is off-channel meanwhile
+    static const size_t BLE_SCAN_MAX = 64;                   // scan records looked at
     static const unsigned long IDENTIFY_PULSE_MS = 300;
     static const uint8_t IDENTIFY_PULSES = 3;
 #endif
@@ -773,6 +798,9 @@ class GlowlineUsermod : public Usermod {
           lastPingSentAt = millis();
           Serial.print(F("glowline ws: connected, free heap: "));
           Serial.println(ESP.getFreeHeap());
+#ifdef GLOWLINE_IMPROV_BLE
+          glowlineWrongPwRestart = 0;  // a later rejected password may restart into setup mode again
+#endif
           sendFrame(0x1, (const uint8_t*)"hello from glowline", 20);
           if (successSignalPending) {
             successSignalPending = false;
@@ -2006,7 +2034,8 @@ class GlowlineUsermod : public Usermod {
       id.passphrase = glowlineApPskGet();
       GlowlineBle::start(id,
                          [this](const char* ssid, const char* pass) { bleWifiReceived(ssid, pass); },
-                         [this]() { startIdentify(); });
+                         [this]() { startIdentify(); },
+                         [this]() { bleScanRequested(); });
       mbedtls_platform_zeroize((void*)id.passphrase.c_str(), id.passphrase.length());
     }
 
@@ -2025,6 +2054,89 @@ class GlowlineUsermod : public Usermod {
       bleAttemptPending = true;
     }
 
+    // Improv's security names (https://www.improv-wifi.com/ble/); nullptr = the board can't join it, left
+    // out of the list. With a password Arduino's STA joins only WPA2 or better (STA.cpp _minSecurity), so
+    // WEP and WPA-only are out; so are enterprise networks (WLED has no EAP settings) and OWE/DPP.
+    static const char* scanAuthName(wifi_auth_mode_t auth) {
+      switch (auth) {
+        case WIFI_AUTH_OPEN:                    return "NO";
+        case WIFI_AUTH_WPA2_PSK:                return "WPA2";
+        case WIFI_AUTH_WPA_WPA2_PSK:            return "WPA/WPA2";
+        case WIFI_AUTH_WPA3_PSK:
+        case WIFI_AUTH_WPA3_EXT_PSK:            // "same result as WIFI_AUTH_WPA3_PSK" (esp_wifi_types_generic.h)
+        case WIFI_AUTH_WPA3_EXT_PSK_MIXED_MODE: return "WPA3";
+        case WIFI_AUTH_WPA2_WPA3_PSK:           return "WPA2/WPA3";
+        case WIFI_AUTH_WAPI_PSK:                return "WAPI";
+        default:                                return nullptr;
+      }
+    }
+
+    // Improv 0x04 (REQ-135). One scan at a time; a second ask while one runs gets the same answer.
+    void bleScanRequested() {
+      if (bleScanPending) return;
+      bleScanPending = true;
+      bleScanAskedAt = millis();
+      bleScanStart();
+    }
+
+    void bleScanStart() {
+      bleScanTriedAt = millis();
+      int16_t rc = WiFi.scanNetworks(true, false, false, BLE_SCAN_MS_PER_CHANNEL);
+      Serial.printf("glowline ble: Wi-Fi scan %s\n", rc == WIFI_SCAN_RUNNING ? "started" : "refused, retrying");
+    }
+
+    void bleScanTick() {
+      if (!bleScanPending) return;
+      int16_t n = WiFi.scanComplete();
+      if (n == WIFI_SCAN_RUNNING) {
+        if (millis() - bleScanAskedAt < BLE_SCAN_TIMEOUT_MS) return;
+      } else if (n == WIFI_SCAN_FAILED) {
+        if (millis() - bleScanAskedAt < BLE_SCAN_TIMEOUT_MS) {
+          if (millis() - bleScanTriedAt >= BLE_SCAN_RETRY_MS) bleScanStart();
+          return;
+        }
+      } else {
+        bleScanPending = false;
+        bleSendScan(n);
+        WiFi.scanDelete();
+        return;
+      }
+      bleScanPending = false;
+      GlowlineBle::reportScanFailed();
+    }
+
+    void bleSendScan(int16_t found) {
+      size_t count = found > (int16_t)BLE_SCAN_MAX ? BLE_SCAN_MAX : (size_t)found;
+      // From the heap, only for this: a Bluetooth boot makes no TLS connection, and 3 KB kept for good
+      // would be missed by TLS in every other boot.
+      std::unique_ptr<GlowlineScan::Net[]> nets(new (std::nothrow) GlowlineScan::Net[count ? count : 1]);
+      if (!nets) { GlowlineBle::reportScanFailed(); return; }
+      for (size_t i = 0; i < count; i++) {
+        strlcpy(nets[i].ssid, WiFi.SSID(i).c_str(), sizeof(nets[i].ssid));
+        nets[i].rssi = WiFi.RSSI(i);
+        nets[i].auth = scanAuthName(WiFi.encryptionType(i));
+      }
+      size_t kept = GlowlineScan::clean(nets.get(), count);
+      uint8_t out[255];
+      size_t packed = 0;
+      size_t len = GlowlineScan::pack(nets.get(), kept, out, GlowlineBle::maxResultData(), &packed);
+      Serial.printf("glowline ble: Wi-Fi scan found %d, %u to list\n", found, (unsigned)kept);
+      GlowlineBle::reportScan(out, len, packed);
+    }
+
+    // REQ-135: in a boot without Bluetooth, a saved network that keeps rejecting the password restarts
+    // the board once; the next boot's saved Wi-Fi fails and the hotspot and Bluetooth come up as usual.
+    // `reason` is one STA disconnect, from loop(). Never on an OTA image not yet confirmed: a restart then
+    // rolls it back (bootloader, PENDING_VERIFY) and the server would refuse that version as bad.
+    void wrongPwCheck(uint8_t reason) {
+      if (GlowlineBle::active() || doReboot || otaPendingVerify || !WLED_WIFI_CONFIGURED) return;
+      if (!wrongPwWatch.failed(!strcmp(staReasonName(reason), "wrong_password"), millis())) return;
+      if (glowlineWrongPwRestart == WRONG_PW_RESTART_MAGIC) return;  // once until the server is reached
+      glowlineWrongPwRestart = WRONG_PW_RESTART_MAGIC;
+      Serial.println(F("glowline wifi: the saved network keeps rejecting the password, restarting into setup mode"));
+      doReboot = true;
+    }
+
     void bleTick() {
       if (!bleStartTried) {
         if (bleBootWindow) {
@@ -2038,13 +2150,12 @@ class GlowlineUsermod : public Usermod {
       GlowlineBle::loop();
       if (!GlowlineBle::active()) return;
 
+      bleScanTick();
+      // Until a phone sends Wi-Fi settings, 0x82 tells why the saved network fails (REQ-135).
+      if (WLED_WIFI_CONFIGURED && staLastReason) GlowlineBle::reportSavedNetwork(staReasonName(staLastReason));
+
       if (bleBootWindow) {
-        // WLED closes the hotspot when the STA connects (wled.cpp handleConnection(), after
-        // connected()); stock BOOT 5-10 s keeps it open, so reopen it once.
-        if (WLED_CONNECTED && !apActive && !bleBootApReopened) {
-          bleBootApReopened = true;
-          WLED::instance().initAP(true);
-        }
+        // The hotspot stays up when the STA connects meanwhile (glowlineBleKeepAp()), as stock BOOT 5-10 s keeps it.
         if (!bleAttemptPending && bleReleaseAt == 0 && millis() - bleBootWindowStartedAt >= BLE_BOOT_WINDOW_MS) {
           bleRestart("BOOT window over");
           return;
@@ -2215,6 +2326,8 @@ class GlowlineUsermod : public Usermod {
           Serial.printf("glowline ble: BOOT restart, Bluetooth setup and the hotspot open for %lu s%s\n",
                         BLE_BOOT_WINDOW_MS / 1000, cleared ? "" : " (flag NVS clear FAILED, the next boot opens them too)");
         }
+        if (glowlineWrongPwRestart == WRONG_PW_RESTART_MAGIC)
+          Serial.println(F("glowline wifi: restarted after a rejected password; no second such restart until the server is reached"));
       }
 #endif
 
@@ -2279,10 +2392,16 @@ class GlowlineUsermod : public Usermod {
     void loop() {
       // Wi-Fi disconnect reasons are recorded on the event task (onStaEvent()); print them from here.
       if ((uint8_t)(staRecentCount - staLoggedCount) > 4) staLoggedCount = staRecentCount - 4; // older ones were overwritten
+#ifdef GLOWLINE_IMPROV_BLE
+      if (staAssociatedAt) wrongPwWatch.associated();
+#endif
       while (staLoggedCount != staRecentCount) {
         uint8_t reason = staRecent[staLoggedCount % 4];
         staLoggedCount++;
         Serial.printf("glowline wifi: disconnected, reason %u (%s)\n", reason, staReasonName(reason));
+#ifdef GLOWLINE_IMPROV_BLE
+        wrongPwCheck(reason);
+#endif
       }
       advanceBootCue();
 #ifdef GLOWLINE_IMPROV_BLE

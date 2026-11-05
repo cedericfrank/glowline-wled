@@ -5,6 +5,7 @@
 #include "glowline_ble.h"
 #include <BLEDevice.h>
 #include <BLEServer.h>
+#include "host/ble_gap.h"
 #include "esp_heap_caps.h"
 #include "esp_random.h"
 #include "mbedtls/gcm.h"
@@ -28,11 +29,11 @@ const uint16_t SERVICE_DATA_UUID = 0x4677;
 enum : uint8_t { ST_AUTH_REQUIRED = 0x01, ST_AUTHORIZED = 0x02, ST_PROVISIONING = 0x03, ST_PROVISIONED = 0x04 };
 enum : uint8_t { ERR_NONE = 0x00, ERR_INVALID_RPC = 0x01, ERR_UNKNOWN_RPC = 0x02, ERR_UNABLE_TO_CONNECT = 0x03,
                  ERR_NOT_AUTHORIZED = 0x04, ERR_UNKNOWN = 0xFF /* also: busy connecting */ };
-enum : uint8_t { CMD_WIFI = 0x01, CMD_IDENTIFY = 0x02, CMD_DEVICE_INFO = 0x03,
+enum : uint8_t { CMD_WIFI = 0x01, CMD_IDENTIFY = 0x02, CMD_DEVICE_INFO = 0x03, CMD_SCAN = 0x04,
                  // Lumen's own commands (contract "BLE provisioning (Improv)"); generic Improv clients get
                  // "unknown command" for them.
                  CMD_LUMEN_WIFI = 0x80, CMD_LUMEN_CHALLENGE = 0x81, CMD_LUMEN_STATUS = 0x82 };
-const uint8_t CAPS = 0x01 /* identify */ | 0x02 /* device info */;
+const uint8_t CAPS = 0x01 /* identify */ | 0x02 /* device info */ | 0x04 /* scan Wi-Fi (REQ-135) */;
 
 // ---- Lumen's encrypted Wi-Fi command ----
 // Plain Improv sends the Wi-Fi password unencrypted; a board with a hotspot passphrase refuses that
@@ -59,6 +60,9 @@ Phase phase = Phase::OFF;
 Identity ident;
 WifiHandler wifiHandler;
 IdentifyHandler identifyHandler;
+ScanHandler scanHandler;
+
+BLEServer* server = nullptr;
 
 BLECharacteristic* chState = nullptr;
 BLECharacteristic* chError = nullptr;
@@ -73,6 +77,7 @@ uint8_t boardNonce[NONCE_LEN];
 int badTags = 0;
 const char* wifiState = "idle";  // CMD_LUMEN_STATUS: idle, connecting, connected, failed
 String wifiDetail = "";          // the reason when failed, the URL when connected
+bool phoneSentWifi = false;      // a phone sent Wi-Fi settings this boot; until then 0x82 is the saved network's
 
 // Written by the BLE host task (callbacks), read by loop().
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
@@ -86,6 +91,8 @@ volatile bool rxOverflow = false;
 volatile bool centralConnected = false;
 volatile bool sawConnect = false;
 volatile bool sawDisconnect = false;
+volatile int disconnectReason = -1;  // NimBLE's (BLE_HS_ERR_HCI_BASE + HCI reason), from gapListener
+ble_gap_event_listener gapListener;
 
 void logHeap(const char* label) {
   Serial.printf("glowline ble: %s, internal heap free %u, largest block %u\n", label,
@@ -147,6 +154,20 @@ void setError(uint8_t e) {
   chError->notify();
 }
 
+// RPC result: command, data length, data, checksum. `data` may point into a buffer of RX_MAX bytes.
+void sendRaw(uint8_t cmd, const uint8_t* data, size_t len) {
+  uint8_t out[RX_MAX];
+  if (len > 255) len = 255;
+  out[0] = cmd;
+  out[1] = (uint8_t)len;
+  memmove(out + 2, data, len);
+  uint8_t sum = 0;
+  for (size_t i = 0; i < len + 2; i++) sum += out[i];
+  out[len + 2] = sum;
+  chResult->setValue(out, len + 3);
+  chResult->notify();
+}
+
 // RPC result: command, data length, then each string as length + bytes, then the checksum.
 void sendResult(uint8_t cmd, const String* strings, size_t count) {
   uint8_t out[RX_MAX];
@@ -158,13 +179,7 @@ void sendResult(uint8_t cmd, const String* strings, size_t count) {
     memcpy(out + n, strings[i].c_str(), len);
     n += len;
   }
-  out[0] = cmd;
-  out[1] = (uint8_t)(n - 2);
-  uint8_t sum = 0;
-  for (size_t i = 0; i < n; i++) sum += out[i];
-  out[n++] = sum;
-  chResult->setValue(out, n);
-  chResult->notify();
+  sendRaw(cmd, out + 2, n - 2);
 }
 
 String hex(const uint8_t* b, size_t n) {
@@ -187,6 +202,7 @@ bool takeWifiData(const uint8_t* d, size_t len, uint8_t cmd) {
   memcpy(ssid, d + 1, ssidLen); ssid[ssidLen] = 0;
   memcpy(pass, d + 2 + ssidLen, passLen); pass[passLen] = 0;
   lastWifiCmd = cmd;
+  phoneSentWifi = true;
   wifiState = "connecting";
   wifiDetail = "";
   setError(ERR_NONE);
@@ -265,6 +281,10 @@ void handlePacket(const uint8_t* p, size_t len) {
     case CMD_IDENTIFY:
       if (identifyHandler) identifyHandler();
       break;
+    case CMD_SCAN:
+      // Reveals nothing the air doesn't, so any state; the result comes later (reportScan()).
+      if (scanHandler) scanHandler(); else setError(ERR_UNKNOWN_RPC);
+      break;
     case CMD_WIFI:
       // A board with a passphrase takes Wi-Fi settings only encrypted (CMD_LUMEN_WIFI).
       if (state != ST_AUTHORIZED) { setError(busy ? ERR_UNKNOWN : ERR_NOT_AUTHORIZED); break; }
@@ -322,13 +342,22 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onDisconnect(BLEServer*) override { centralConnected = false; sawDisconnect = true; }
 };
 
+// The core's callbacks don't pass the disconnect reason (BLEServer.cpp handleGAPEvent()); a NimBLE
+// listener gets it. 0x208 = link supervision timeout (the board stopped answering, e.g. radio busy),
+// 0x213 = the phone closed the link, 0x216 = the board closed it (REQ-135 item 3). Host task: copy only.
+int onGapEvent(ble_gap_event* event, void*) {
+  if (event->type == BLE_GAP_EVENT_DISCONNECT) disconnectReason = event->disconnect.reason;
+  return 0;
+}
+
 }  // namespace
 
-bool start(const Identity& id, WifiHandler onWifi, IdentifyHandler onIdentify) {
+bool start(const Identity& id, WifiHandler onWifi, IdentifyHandler onIdentify, ScanHandler onScan) {
   if (phase != Phase::OFF || btMemReleased(BT_MODE_BLE)) return false;
   ident = id;
   wifiHandler = onWifi;
   identifyHandler = onIdentify;
+  scanHandler = onScan;
   logHeap("starting");
   kdReady = deriveKd();
   if (ident.passphrase.length() > 0 && !kdReady) {
@@ -344,8 +373,9 @@ bool start(const Identity& id, WifiHandler onWifi, IdentifyHandler onIdentify) {
     Serial.println(F("glowline ble: not started, BLEDevice::init() failed"));
     return false;
   }
-  BLEServer* server = BLEDevice::createServer();
+  server = BLEDevice::createServer();
   server->setCallbacks(new ServerCallbacks());
+  ble_gap_event_listener_register(&gapListener, onGapEvent, nullptr);
   BLEService* svc = server->createService(SVC_UUID);
   chState = svc->createCharacteristic(STATE_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
   chError = svc->createCharacteristic(ERROR_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
@@ -375,6 +405,7 @@ void loop() {
   }
   if (sawDisconnect) {
     sawDisconnect = false;
+    Serial.printf("glowline ble: disconnect reason 0x%x\n", disconnectReason);
     newBoardNonce();  // a new connection gets a new challenge
     // The core leaves advertising off after a disconnect unless advertiseOnDisconnect(true), which
     // it skips under CONFIG_BT_NIMBLE_EXT_ADV (BLEServer.cpp:93, 854-859); restart it here instead.
@@ -399,6 +430,37 @@ void loop() {
 
 bool active() { return phase == Phase::ON; }
 bool released() { return phase == Phase::RELEASED; }
+// Not while the board joins the Wi-Fi a phone sent: pausing the STA then would abort that very join
+// (a phone that reconnects mid-attempt, lumen-ios 914fbdc).
+bool phoneConnected() { return phase == Phase::ON && centralConnected && state != ST_PROVISIONING; }
+
+size_t maxResultData() {
+  // A notification carries at most ATT MTU - 3 bytes (the core truncates the rest, BLECharacteristic.cpp
+  // notify()); the result adds command, length and checksum. 23 is the minimum MTU before any exchange.
+  uint16_t mtu = (phase == Phase::ON && server) ? server->getPeerMTU(server->getConnId()) : 0;
+  if (mtu < 23) mtu = 23;
+  size_t n = (size_t)mtu - 3 - 3;
+  return n > 255 ? 255 : n;
+}
+
+void reportScan(const uint8_t* data, size_t len, size_t networks) {
+  if (phase != Phase::ON) return;
+  sendRaw(CMD_SCAN, data, len);
+  Serial.printf("glowline ble: Wi-Fi list sent, %u network(s) in %u bytes\n", (unsigned)networks, (unsigned)len);
+}
+
+void reportScanFailed() {
+  if (phase != Phase::ON) return;
+  setError(ERR_UNKNOWN);
+  Serial.println(F("glowline ble: Wi-Fi scan failed, told the phone"));
+}
+
+void reportSavedNetwork(const char* reason) {
+  if (phase != Phase::ON || phoneSentWifi) return;
+  if (!strcmp(wifiState, "failed") && wifiDetail == reason) return;
+  wifiState = "failed";
+  wifiDetail = reason;
+}
 
 void reportConnected(const char* url) {
   if (phase != Phase::ON) return;
@@ -423,8 +485,10 @@ void release(const char* why) {
   if (phase != Phase::ON) return;
   phase = Phase::RELEASED;
   Serial.printf("glowline ble: releasing (%s)\n", why);
+  ble_gap_event_listener_unregister(&gapListener);
   BLEDevice::deinit(true);  // frees the controller's memory; BLE can't start again until a reboot
   chState = chError = chResult = nullptr;
+  server = nullptr;
   mbedtls_platform_zeroize(kd, sizeof(kd));
   kdReady = false;
   if (ident.passphrase.length()) mbedtls_platform_zeroize((void*)ident.passphrase.c_str(), ident.passphrase.length());

@@ -23,13 +23,21 @@ struct Identity {
 // Both run on WLED's main task, from loop().
 typedef std::function<void(const char* ssid, const char* password)> WifiHandler;
 typedef std::function<void()> IdentifyHandler;
+typedef std::function<void()> ScanHandler;  // a phone asked for the Wi-Fi list: answer with reportScan*()
 
-bool start(const Identity& id, WifiHandler onWifi, IdentifyHandler onIdentify);
+bool start(const Identity& id, WifiHandler onWifi, IdentifyHandler onIdentify, ScanHandler onScan);
 void loop();
 bool active();    // up: advertising or a phone connected
 bool released();  // was up this boot and has been released (no restart until reboot)
+bool phoneConnected();  // and not joining the Wi-Fi it sent
 void reportConnected(const char* url);  // the Wi-Fi a phone sent is up
 void reportFailed(const char* reason);  // it didn't connect; reason as in /json/info lumen.wifi.reason
+// The most result data (Improv strings) one notification to the connected phone can carry, <= 255.
+size_t maxResultData();
+void reportScan(const uint8_t* data, size_t len, size_t networks);  // Improv 0x04 result strings
+void reportScanFailed();                                            // error 0xFF: ask again
+// Until a phone sends Wi-Fi settings this boot, 0x82 reports the saved network's failure (REQ-135).
+void reportSavedNetwork(const char* reason);
 void release(const char* why);
 // Never started this boot and not needed: hand the BLE memory the core holds back from boot
 // (initArduino(), esp32-hal-misc.c:353) to the heap. start() refuses afterwards, until a reboot.
