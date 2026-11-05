@@ -2004,12 +2004,15 @@ class GlowlineUsermod : public Usermod {
 
     // How far the join got: a later stage outranks an earlier one. A board whose password was rejected
     // has seen the network, so an occasional scan miss (NO_AP_FOUND between wrong-password codes, seen
-    // on the bench) must not turn it into "network_not_found". Generic codes rank lowest.
+    // on the bench) must not turn it into "network_not_found". Generic codes rank lowest, except
+    // AUTH_EXPIRE: the network answered (an iPhone hotspot's wrong password, REQ-135 bench 2026-11-05,
+    // mixed with NO_AP_FOUND), so it outranks "network_not_found" while still named "connection_failed".
     static uint8_t staReasonRank(uint8_t reason) {
       const char* name = staReasonName(reason);
-      if (!strcmp(name, "wrong_password"))       return 4;
-      if (!strcmp(name, "unsupported_security")) return 3;
-      if (!strcmp(name, "weak_signal"))          return 2;
+      if (!strcmp(name, "wrong_password"))       return 5;
+      if (!strcmp(name, "unsupported_security")) return 4;
+      if (!strcmp(name, "weak_signal"))          return 3;
+      if (reason == WIFI_REASON_AUTH_EXPIRE)     return 2;
       if (!strcmp(name, "network_not_found"))    return 1;
       return 0;
     }
@@ -2124,13 +2127,20 @@ class GlowlineUsermod : public Usermod {
       GlowlineBle::reportScan(out, len, packed);
     }
 
+    static_assert(GlowlineWrongPw::REASON_AUTH_EXPIRE == WIFI_REASON_AUTH_EXPIRE &&
+                  GlowlineWrongPw::REASON_MIC_FAILURE == WIFI_REASON_MIC_FAILURE &&
+                  GlowlineWrongPw::REASON_4WAY_HANDSHAKE_TIMEOUT == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT &&
+                  GlowlineWrongPw::REASON_AUTH_FAIL == WIFI_REASON_AUTH_FAIL &&
+                  GlowlineWrongPw::REASON_HANDSHAKE_TIMEOUT == WIFI_REASON_HANDSHAKE_TIMEOUT,
+                  "glowline_wrongpw.h reason codes must match esp_wifi_types_generic.h");
+
     // REQ-135: in a boot without Bluetooth, a saved network that keeps rejecting the password restarts
     // the board once; the next boot's saved Wi-Fi fails and the hotspot and Bluetooth come up as usual.
     // `reason` is one STA disconnect, from loop(). Never on an OTA image not yet confirmed: a restart then
     // rolls it back (bootloader, PENDING_VERIFY) and the server would refuse that version as bad.
     void wrongPwCheck(uint8_t reason) {
       if (GlowlineBle::active() || doReboot || otaPendingVerify || !WLED_WIFI_CONFIGURED) return;
-      if (!wrongPwWatch.failed(!strcmp(staReasonName(reason), "wrong_password"), millis())) return;
+      if (!wrongPwWatch.failed(GlowlineWrongPw::rejects(reason), millis())) return;
       if (glowlineWrongPwRestart == WRONG_PW_RESTART_MAGIC) return;  // once until the server is reached
       glowlineWrongPwRestart = WRONG_PW_RESTART_MAGIC;
       Serial.println(F("glowline wifi: the saved network keeps rejecting the password, restarting into setup mode"));
@@ -2166,7 +2176,7 @@ class GlowlineUsermod : public Usermod {
         // Success arrives through connected(). A rejected password ends the wait at once; a network
         // not seen yet waits for BLE_ATTEMPT_MS (scans miss now and then, see staReasonRank()).
         uint8_t reason = staLastReason;
-        bool definite = staRecentCount != bleAttemptRecentCount && staReasonRank(reason) >= 3;
+        bool definite = staRecentCount != bleAttemptRecentCount && staReasonRank(reason) >= 4;  // wrong password or unsupported security
         if (definite || millis() - bleAttemptAt >= BLE_ATTEMPT_MS) {
           bleAttemptPending = false;
           GlowlineBle::reportFailed(staReasonName(reason));

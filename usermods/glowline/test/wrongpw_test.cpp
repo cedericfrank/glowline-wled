@@ -54,7 +54,29 @@ static void countDoesNotWrap() {
   CHECK(w.failed(true, SPAN_MS));
 }
 
+static void rejectionCodes() {
+  CHECK(rejects(15) && rejects(204) && rejects(202) && rejects(14));  // wrong password, WPA2 and WPA3
+  CHECK(rejects(2));                                                   // AUTH_EXPIRE: an iPhone hotspot's
+  CHECK(!rejects(201) && !rejects(36) && !rejects(200) && !rejects(205) && !rejects(1) && !rejects(4));
+}
+
+static void iphoneHotspotWithAChangedPasswordFires() {
+  // Bench 2026-11-05 (REQ-135 C): after the hotspot's password changed, only AUTH_EXPIRE (2), STA_LEAVING
+  // (36) and NO_AP_FOUND (201), a few seconds apart. Without AUTH_EXPIRE counting, this never fired.
+  const uint8_t seen[] = { 2, 201, 36, 2, 201, 36, 2, 2, 201, 36, 2, 36, 2, 2, 2 };
+  Watch w;
+  bool fired = false;
+  uint32_t t = 0;
+  for (uint8_t r : seen) {
+    if (w.failed(rejects(r), t)) { fired = true; break; }
+    t += 4000;
+  }
+  CHECK(fired && t >= SPAN_MS);
+}
+
 int main() {
+  rejectionCodes();
+  iphoneHotspotWithAChangedPasswordFires();
   threeRejectionsOverTheSpanFire();
   quickRejectionsAloneDoNotFire();
   routerOffNeverFires();
