@@ -75,6 +75,9 @@ static_assert(!glowlineStrEq(GLOWLINE_FW_VERSION, "0.0.0-dev"),
 #ifndef GLOWLINE_IMPROV_BLE
 #error "lumen envs need -D GLOWLINE_IMPROV_BLE: without it the app can't set up the board's Wi-Fi over Bluetooth (glowline_ble.cpp)."
 #endif
+#ifndef GLOWLINE_BLANK_CUT_LEDS
+#error "lumen envs need -D GLOWLINE_BLANK_CUT_LEDS: without it LEDs cut off by a shorter length keep their last colour until a power cut (see glowlineBeforeBusInit(), below)."
+#endif
 // Lumen envs dial only their compiled hosts (glowlineHostAllowed(), below).
 #define GLOWLINE_COMPILED_HOSTS_ONLY
 #endif
@@ -2392,6 +2395,41 @@ class GlowlineUsermod : public Usermod {
       delayMicroseconds(GLOWLINE_LED_LATCH_US);
     }
 
+#ifdef GLOWLINE_BLANK_CUT_LEDS
+    // True if a LED is still covered by the outputs WLED is about to build (busConfigs, filled by
+    // cfg.cpp's deserializeConfig() before it sets doInitBusses).
+    static bool keptAfterBusInit(uint16_t pix) {
+      for (const BusConfig& bc : busConfigs)
+        if (pix >= bc.start && pix < bc.start + bc.count) return true;
+      return false;
+    }
+
+    // REQ-165: LEDs hold their last colour while powered, and the app's shorter length is applied live
+    // (POST /json/cfg, no reboot: wled.cpp re-inits the outputs), so the LEDs it cuts off would keep
+    // whatever they last showed until a power cut. Right before the rebuild, the old (longer) output
+    // still reaches them: send it one frame with just those LEDs off. Its other LEDs resend the
+    // editing buffer, which after a show holds the frame before (NeoPixelBus swaps its two buffers),
+    // already brightness-limited. The line is then held low for the latch gap: the old output's
+    // destructor releases the pin (NeoEsp32RmtXMethod.h ~NeoEsp32RmtMethodBase()) right after.
+    void blankCutLeds() {
+      for (size_t b = 0; b < BusManager::getNumBusses(); b++) {
+        Bus* bus = BusManager::getBus(b);
+        if (!bus || !bus->isDigital()) continue;
+        uint16_t cut = 0;
+        for (uint16_t i = 0; i < bus->getLength(); i++) {
+          if (keptAfterBusInit(bus->getStart() + i)) continue;
+          bus->setPixelColor(i, 0);
+          cut++;
+        }
+        if (!cut) continue;
+        waitForLatchGap();
+        bus->show();
+        waitForLatchGap();
+        Serial.printf("glowline leds: %u LEDs past the new length switched off\n", (unsigned)cut);
+      }
+    }
+#endif
+
     // Called every frame, after effects are processed but before strip.show()
     // -- lets the boot cue paint raw pixels with exact timing, independent of
     // WLED's effect engine and whatever segment/effect state underlies it.
@@ -3126,5 +3164,13 @@ REGISTER_USERMOD(glowline);
 // buffer locked. Serial only: see GlowlineUsermod::serialCommand().
 void glowlineSerialCommand(JsonObject cmd) {
   glowline.serialCommand(cmd);
+}
+#endif
+
+#ifdef GLOWLINE_BLANK_CUT_LEDS
+// Called by WLED's loop (wled00/wled.cpp) right before it rebuilds the LED outputs after a settings
+// change. See GlowlineUsermod::blankCutLeds().
+void glowlineBeforeBusInit() {
+  glowline.blankCutLeds();
 }
 #endif

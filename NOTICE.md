@@ -25,7 +25,7 @@ Every individual change, with its date and author, is in this repository's git h
 | `wled00/wled.h` | Setup hotspot named `Lumen-XXXX` (from the MAC) | 2026-09-03, 2026-09-22 |
 | `wled00/const.h` | Default mDNS name prefix can be set per build (`lumen-XXXXXX`) | 2026-09-22 |
 | `wled00/util.cpp` | Uses that mDNS name prefix for the fallback host name | 2026-09-22 |
-| `wled00/wled.cpp` | mDNS name prefix; the usermod confirms a new firmware image instead of `setup()`; the setup hotspot stays up during Wi-Fi retries; the hotspot uses the board's own passphrase | 2026-09-22, 2026-10-12, 2026-10-13, 2026-10-14 |
+| `wled00/wled.cpp` | mDNS name prefix; the usermod confirms a new firmware image instead of `setup()`; the setup hotspot stays up during Wi-Fi retries; the hotspot uses the board's own passphrase; before the LED outputs are rebuilt, the usermod switches off the LEDs a shorter length cuts off | 2026-09-22, 2026-10-12, 2026-10-13, 2026-10-14, 2026-11-06 |
 | `wled00/wled_serial.cpp` | A `{"lumen":{...}}` line on the serial port goes to the usermod's setup command instead of the JSON state API | 2026-10-30 |
 | `wled00/button.cpp` | Holding BOOT 5-10 s restarts the board with Bluetooth setup and the hotspot on, instead of only opening the hotspot | 2026-10-31 |
 | `wled00/data/settings_sec.htm` | The About section names this modified version and links its source code | 2026-10-30 |

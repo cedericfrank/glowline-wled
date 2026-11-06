@@ -10,6 +10,9 @@
 #endif
 #endif
 #include "ota_update.h"
+#ifdef GLOWLINE_BLANK_CUT_LEDS
+void glowlineBeforeBusInit(); // usermods/glowline/glowline.cpp
+#endif
 #ifdef WLED_ENABLE_AOTA
   #define NO_OTA_PORT
   #include <ArduinoOTA.h>
@@ -241,6 +244,9 @@ void WLED::loop()
     doInitBusses = false;
     DEBUG_PRINTLN(F("Re-init busses."));
     bool aligned = strip.checkSegmentAlignment(); //see if old segments match old bus(ses)
+#ifdef GLOWLINE_BLANK_CUT_LEDS
+    glowlineBeforeBusInit(); // glowline: switch off the LEDs a shorter length cuts off, while the old bus still reaches them
+#endif
     strip.finalizeInit(); // will create buses and also load default ledmap if present
     if (aligned) strip.makeAutoSegments();
     else strip.fixInvalidSegments();
