@@ -102,6 +102,13 @@ static_assert(!glowlineStrEq(GLOWLINE_FW_VERSION, "0.0.0-dev"),
 #define GLOWLINE_CUE_MAX_LEDS 65535
 #endif
 
+// Minimum low time on the LED data line between two frames, on top of the RMT driver's own 50 us
+// reset; see waitForLatchGap(). 300 us is NeoPixelBus's own WS2812x reset (NeoEsp32RmtSpeed.h:68),
+// above the 280 us current WS2812B parts need.
+#ifndef GLOWLINE_LED_LATCH_US
+#define GLOWLINE_LED_LATCH_US 300
+#endif
+
 // Build-time default backend for boards whose saved host is empty (never set up, or cleared in
 // Settings -> Usermods) -- applied in readFromConfig(), below. A saved non-empty host is never
 // replaced, so existing boards keep whatever they're configured with. Set per env in
@@ -2371,10 +2378,25 @@ class GlowlineUsermod : public Usermod {
 #endif
     }
 
+    // Keeps the data line low for GLOWLINE_LED_LATCH_US between two frames (REQ-165). The S3's RMT
+    // method (NeoPixelBus CORE3 76afe832, NeoEsp32RmtXMethod.h:267) ends each frame with a fixed 50 us
+    // reset, and its Update() starts the next frame as soon as the previous one is out -- which
+    // happens whenever strip.trigger() lands mid-frame (FX_fcn.cpp:1314). Current WS2812B parts need
+    // ~280 us to latch: below that, LEDs 1..len don't latch and pass the next frame's first pixels on
+    // to the LEDs past the set length, so a strip set shorter than its LED count lights its tail with
+    // the look. Runs from the show callback (wled.cpp:671), i.e. inside every WS2812FX::show(), before
+    // any pixel reaches the bus; waiting longer is harmless, so the gap is a lower bound.
+    static void waitForLatchGap() {
+      unsigned long t0 = millis();
+      while (!BusManager::canAllShow() && millis() - t0 < 50) delay(1);
+      delayMicroseconds(GLOWLINE_LED_LATCH_US);
+    }
+
     // Called every frame, after effects are processed but before strip.show()
     // -- lets the boot cue paint raw pixels with exact timing, independent of
     // WLED's effect engine and whatever segment/effect state underlies it.
     void handleOverlayDraw() {
+      waitForLatchGap();
 #ifdef GLOWLINE_SERIAL_PROVISION
       if (burnInRun || burnInShowFailed) {
         uint16_t n = strip.getLengthTotal();
