@@ -21,6 +21,7 @@
 #include <memory>
 #include <new>
 #include "esp_system.h"
+#include "esp_timer.h"
 
 #if __has_include(<WiFiClientSecure.h>)
   #include <WiFiClientSecure.h>
@@ -731,7 +732,8 @@ class GlowlineUsermod : public Usermod {
       Serial.println(ESP.getFreeHeap());
 
       String target = String("/ws?device=") + urlEncode(wsDeviceId) + "&fw=" + urlEncode(String(F(GLOWLINE_FW_VERSION)))
-                      + "&caps=heartbeat,probe,ack,rotate,state" + "&rst=" + resetReasonName();
+                      + "&caps=heartbeat,probe,ack,rotate,state" + "&rst=" + resetReasonName()
+                      + "&up=" + String(uptimeSeconds());
       Serial.print(F("glowline ws: GET "));
       Serial.print(target);
       Serial.println(F(" (token in the Authorization header)"));
@@ -1233,6 +1235,13 @@ class GlowlineUsermod : public Usermod {
         case ESP_RST_EXT:        return "external";
         default:                 return "other";
       }
+    }
+
+    // Whole seconds since this boot, sent as &up= next to &rst= so the server counts each boot once
+    // (boot time = connect time - up) and a Wi-Fi reconnect adds none. esp_timer_get_time(), not
+    // millis(): millis() is 32-bit and wraps after ~49.7 days, which would look like a new boot. REQ-146.
+    static uint32_t uptimeSeconds() {
+      return (uint32_t)(esp_timer_get_time() / 1000000LL);
     }
 
     void advanceBootCue() {
