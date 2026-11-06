@@ -1146,6 +1146,7 @@ class GlowlineUsermod : public Usermod {
       serializeJson(root, json);
       releaseJSONBufferLock();
 
+      waitForStripIdle();
       File f = WLED_FS.open(VIEW_FILE, "r");
       bool same = f && f.size() == json.length() && f.readString() == json;
       if (f) f.close();
@@ -1210,6 +1211,7 @@ class GlowlineUsermod : public Usermod {
       if (!powerPending) { powerPending = true; powerChangedAt = millis(); return; }
       if (millis() - powerChangedAt < POWER_SETTLE_MS) return;
       powerPending = false;
+      waitForStripIdle();
       Preferences prefs;
       bool ok = prefs.begin(TOKEN_NVS_NS, false) && prefs.putBool(POWER_NVS_KEY, on) == 1;
       prefs.end();
@@ -2390,9 +2392,20 @@ class GlowlineUsermod : public Usermod {
     // the look. Runs from the show callback (wled.cpp:671), i.e. inside every WS2812FX::show(), before
     // any pixel reaches the bus; waiting longer is harmless, so the gap is a lower bound.
     static void waitForLatchGap() {
-      unsigned long t0 = millis();
-      while (!BusManager::canAllShow() && millis() - t0 < 50) delay(1);
+      waitForStripIdle();
       delayMicroseconds(GLOWLINE_LED_LATCH_US);
+    }
+
+    // Waits (up to 150 ms, like wled.cpp:204) until no frame is on the LED line. Call it before any
+    // flash access made while the strip runs (REQ-165): the S3's RMT refill interrupt isn't flash-safe
+    // (CONFIG_RMT_ISR_IRAM_SAFE unset in the pioarduino esp32s3 sdkconfig), so a flash read or write
+    // mid-frame stalls it, and with tx wrap on (esp-idf v5.5 rmt_tx.c:333) the channel resends stale
+    // memory: the frame runs on past the set length and lights the LEDs there with the look. WLED's
+    // own preset save waits the same way (presets.cpp:33). From loop(), no new frame can start before
+    // the caller returns.
+    static void waitForStripIdle() {
+      unsigned long t0 = millis();
+      while (strip.isUpdating() && millis() - t0 < 150) delay(1);
     }
 
 #ifdef GLOWLINE_BLANK_CUT_LEDS
