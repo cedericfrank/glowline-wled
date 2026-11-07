@@ -51,7 +51,7 @@ def main():
           f"largest {probe['largest']} B; blocks {probe['blocks']} ({probe['free_blocks']} free)")
     gaps = probe.get("last", []) + probe.get("top", [])
     names = resolve(a.elf, [g["pc"] for g in gaps] + [g.get("epc1", "") for g in gaps]
-                    + [w for g in gaps for w in g.get("w", [])])
+                    + [w for g in gaps for w in g.get("w", [])] + [b for g in gaps for b in g.get("bt", [])])
     for title in ("last", "top"):
         print(f"\n{title}:")
         for g in sorted(probe.get(title, []), key=lambda g: g["ms"]):
@@ -61,8 +61,8 @@ def main():
             for label, addr in (("pc", g["pc"]), ("epc1", g.get("epc1")), ("a0", (g.get("w") or [None] * 4)[3])):
                 if addr:
                     print(f"{'':>12}{label:<5} {addr}  {names.get(addr, '')}")
-            if g.get("w"):
-                print(f"{'':>12}frame {' '.join(g['w'])}")
+            for b in g.get("bt", []):
+                print(f"{'':>12}  <- {b}  {names.get(b, '')}")
 
 
 if __name__ == "__main__":

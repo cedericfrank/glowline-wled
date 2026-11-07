@@ -27,6 +27,8 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "xtensa_context.h"
+#include "esp_debug_helpers.h"
+#include "esp_cpu.h"
 
 namespace GlowlineIsrGap {
 
@@ -40,7 +42,9 @@ struct Gap {
   char other[12];     // the task running on the other core at that moment (a flash op from core 0 shows there)
   uint32_t epc1;      // EPC1 as read in the handler (may be overwritten by a window exception on the way in)
   uint32_t w[6];      // the first words at the TCB's pxTopOfStack: exit, pc, ps, a0, a1, a2 if it is an XtExcFrame
+  uint32_t bt[8];     // the interrupted task's return addresses, innermost first (esp_backtrace_get_next_frame)
 };
+static constexpr uint8_t BT = 8;
 
 static constexpr uint32_t TICK_US = 40;
 static constexpr uint32_t REPORT_US = 100;
@@ -97,6 +101,7 @@ static void IRAM_ATTR tick() {
   g.phase = glowlineIsrGapPhase;
   g.task[0] = '\0';
   g.other[0] = '\0';
+  for (uint8_t i = 0; i < BT; i++) g.bt[i] = 0;
   asm volatile("rsr.epc1 %0" : "=r"(g.epc1));
   for (uint8_t i = 0; i < 6; i++) g.w[i] = 0;
   TaskHandle_t t = xTaskGetCurrentTaskHandle();
@@ -104,6 +109,14 @@ static void IRAM_ATTR tick() {
     const uint32_t* top = *(const uint32_t* const*)t; // TCB.pxTopOfStack = the interrupted frame
     for (uint8_t i = 0; i < 6; i++) g.w[i] = top[i];
     g.pc = top[1];
+    // Walk the interrupted task's stack the way the panic handler does from an exception frame: the
+    // vector spilled its register windows, so each frame's base save area holds the caller's a0/a1.
+    esp_backtrace_frame_t fr = { .pc = top[1], .sp = top[4], .next_pc = top[3], .exc_frame = nullptr };
+    for (uint8_t i = 0; i < BT; i++) g.bt[i] = 0;
+    for (uint8_t i = 0; i < BT && fr.next_pc; i++) {
+      if (!esp_backtrace_get_next_frame(&fr)) break;
+      g.bt[i] = (uint32_t)esp_cpu_pc_to_addr(fr.pc);
+    }
     copyName(g.task, sizeof(g.task), pcTaskGetName(t));
   }
   TaskHandle_t o = xTaskGetCurrentTaskHandleForCore(xPortGetCoreID() ? 0 : 1);
@@ -181,6 +194,8 @@ static void addGap(JsonArray& arr, const Gap& g) {
   o["epc1"] = pc;
   JsonArray w = o.createNestedArray("w");
   for (uint8_t i = 0; i < 6; i++) { snprintf(pc, sizeof(pc), "0x%08lx", (unsigned long)g.w[i]); w.add(pc); }
+  JsonArray bt = o.createNestedArray("bt");
+  for (uint8_t i = 0; i < BT && g.bt[i]; i++) { snprintf(pc, sizeof(pc), "0x%08lx", (unsigned long)g.bt[i]); bt.add(pc); }
   if (g.sinceShow != 0xFFFFFFFFu) o["show"] = g.sinceShow;
 }
 
