@@ -17,6 +17,7 @@ import json
 import os
 import socket
 import struct
+import threading
 import time
 import urllib.request
 
@@ -38,9 +39,9 @@ def get_json(host, path):
 
 
 class Ws:
-    """Minimal WebSocket client: text frames out, replies read and dropped."""
+    """Minimal WebSocket client: text frames out; everything the board sends is read and dropped."""
 
-    def __init__(self, host):
+    def __init__(self, host, lv=False):
         self.sock = socket.create_connection((host, 80), timeout=5)
         key = base64.b64encode(os.urandom(16)).decode()
         self.sock.sendall((f"GET /ws HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
@@ -54,7 +55,21 @@ class Ws:
             head += chunk
         if b" 101 " not in head.split(b"\r\n", 1)[0]:
             raise SystemExit("The board did not open /ws: " + head.split(b"\r\n", 1)[0].decode(errors="replace"))
-        self.sock.setblocking(False)
+        self.frames = 0
+        self.open = True
+        threading.Thread(target=self._reader, daemon=True).start()
+        if lv:
+            self.send({"lv": True})
+
+    def _reader(self):
+        while self.open:
+            try:
+                data = self.sock.recv(65536)
+            except OSError:
+                return
+            if not data:
+                return
+            self.frames += data.count(b"\x82")  # binary frame starts; a rough count of lv frames
 
     def send(self, obj):
         data = json.dumps(obj, separators=(",", ":")).encode()
@@ -63,19 +78,14 @@ class Ws:
         mask = os.urandom(4)
         n = len(data)
         head = bytes([0x81]) + (bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack(">H", n))
-        self.sock.setblocking(True)
         self.sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
-        self.sock.setblocking(False)
-        self.drain()
-
-    def drain(self):
-        try:
-            while self.sock.recv(65536):
-                pass
-        except (BlockingIOError, socket.timeout):
-            pass
 
     def close(self):
+        self.open = False
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         self.sock.close()
 
 
@@ -157,6 +167,7 @@ def main():
     ap.add_argument("--length-test", type=int, default=0, metavar="N",
                     help="change the length N times instead of the rounds (see the top of this file)")
     ap.add_argument("--full", type=int, default=480, help="the strip's real LED count (default 480)")
+    ap.add_argument("--lv", action="store_true", help="ask for the live LED stream on each round, like the app")
     a = ap.parse_args()
     if a.length_test:
         info = get_json(a.host, "/json/info")
@@ -203,10 +214,12 @@ def main():
             if i > 0:
                 ask("Unplug the strip's power, wait 5 s, plug it back in, wait for its look, check the LEDs "
                     "past the length are dark, then press Enter.")
-            ws = Ws(a.host)
-            print(f"\nRound {rnd}: {ROUNDS[rnd]}, a new look every 2 s.")
+            ws = Ws(a.host, lv=a.lv)
+            print(f"\nRound {rnd}: {ROUNDS[rnd]}, a new look every 2 s{' (live LED stream on)' if a.lv else ''}.")
             run_round(ws, looks, a.steps, rnd)
-            results.append(f"round {rnd} " + ask(f"Round {rnd}: were LEDs past the length lit or dark? "
+            if a.lv:
+                print(f"  live LED frames received: about {ws.frames}")
+            results.append(f"round {rnd}{' lv' if a.lv else ''} " + ask(f"Round {rnd}: were LEDs past the length lit or dark? "
                                                  "Type lit or dark."))
             ws.close()
             ws = None
