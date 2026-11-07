@@ -37,6 +37,9 @@ struct Gap {
   uint32_t sinceShow; // us since the last frame start; 0xFFFFFFFF before the first frame
   uint8_t phase;      // glowlineIsrGapPhase at the time (GlowlineLoopPhase)
   char task[12];
+  char other[12];     // the task running on the other core at that moment (a flash op from core 0 shows there)
+  uint32_t epc1;      // EPC1 as read in the handler (may be overwritten by a window exception on the way in)
+  uint32_t w[6];      // the first words at the TCB's pxTopOfStack: exit, pc, ps, a0, a1, a2 if it is an XtExcFrame
 };
 
 static constexpr uint32_t TICK_US = 40;
@@ -71,6 +74,12 @@ static const char* phaseName(uint8_t p) {
   }
 }
 
+static void IRAM_ATTR copyName(char* dst, size_t n, const char* src) {
+  size_t i = 0;
+  for (; src && src[i] && i < n - 1; i++) dst[i] = src[i];
+  dst[i] = '\0';
+}
+
 static void IRAM_ATTR tick() {
   const int64_t now = esp_timer_get_time();
   const int64_t prev = lastTick;
@@ -87,15 +96,18 @@ static void IRAM_ATTR tick() {
   g.sinceShow = lastShow ? (uint32_t)(now - lastShow) : 0xFFFFFFFFu;
   g.phase = glowlineIsrGapPhase;
   g.task[0] = '\0';
+  g.other[0] = '\0';
+  asm volatile("rsr.epc1 %0" : "=r"(g.epc1));
+  for (uint8_t i = 0; i < 6; i++) g.w[i] = 0;
   TaskHandle_t t = xTaskGetCurrentTaskHandle();
   if (t) {
-    const XtExcFrame* f = *(const XtExcFrame* const*)t; // TCB.pxTopOfStack = the interrupted frame
-    g.pc = (uint32_t)f->pc;
-    const char* n = pcTaskGetName(t);
-    uint8_t i = 0;
-    for (; n && n[i] && i < sizeof(g.task) - 1; i++) g.task[i] = n[i];
-    g.task[i] = '\0';
+    const uint32_t* top = *(const uint32_t* const*)t; // TCB.pxTopOfStack = the interrupted frame
+    for (uint8_t i = 0; i < 6; i++) g.w[i] = top[i];
+    g.pc = top[1];
+    copyName(g.task, sizeof(g.task), pcTaskGetName(t));
   }
+  TaskHandle_t o = xTaskGetCurrentTaskHandleForCore(xPortGetCoreID() ? 0 : 1);
+  if (o) copyName(g.other, sizeof(g.other), pcTaskGetName(o));
 
   n100++;
   if (gap >= 250) n250++;
@@ -163,7 +175,12 @@ static void addGap(JsonArray& arr, const Gap& g) {
   snprintf(pc, sizeof(pc), "0x%08lx", (unsigned long)g.pc);
   o["pc"] = pc;
   o["task"] = g.task;
+  o["other"] = g.other;
   o["ph"] = phaseName(g.phase);
+  snprintf(pc, sizeof(pc), "0x%08lx", (unsigned long)g.epc1);
+  o["epc1"] = pc;
+  JsonArray w = o.createNestedArray("w");
+  for (uint8_t i = 0; i < 6; i++) { snprintf(pc, sizeof(pc), "0x%08lx", (unsigned long)g.w[i]); w.add(pc); }
   if (g.sinceShow != 0xFFFFFFFFu) o["show"] = g.sinceShow;
 }
 

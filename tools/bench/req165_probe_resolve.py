@@ -49,14 +49,20 @@ def main():
           f"during a frame: {probe['in100']}/{probe['in250']}/{probe['in1000']}, max {probe['in_max_us']} us")
     print(f"heap walk (largest free block): last {probe['walk_us']} us, max {probe['walk_max_us']} us; "
           f"largest {probe['largest']} B; blocks {probe['blocks']} ({probe['free_blocks']} free)")
-    names = resolve(a.elf, [g["pc"] for g in probe.get("last", []) + probe.get("top", [])])
+    gaps = probe.get("last", []) + probe.get("top", [])
+    names = resolve(a.elf, [g["pc"] for g in gaps] + [g.get("epc1", "") for g in gaps]
+                    + [w for g in gaps for w in g.get("w", [])])
     for title in ("last", "top"):
         print(f"\n{title}:")
         for g in sorted(probe.get(title, []), key=lambda g: g["ms"]):
             show = g.get("show")
             where = f"{show} us after frame start" if show is not None and show < probe.get("frame_us", 0) else "no frame"
-            print(f"  {g['us']:>6} us at {g['ms']:>8} ms  {g['task']:<10} {g['ph']:<12} {where:<28} "
-                  f"{g['pc']}  {names.get(g['pc'], '')}")
+            print(f"  {g['us']:>6} us at {g['ms']:>8} ms  {g['task']:<10} other={g.get('other', ''):<10} {g['ph']:<12} {where}")
+            for label, addr in (("pc", g["pc"]), ("epc1", g.get("epc1")), ("a0", (g.get("w") or [None] * 4)[3])):
+                if addr:
+                    print(f"{'':>12}{label:<5} {addr}  {names.get(addr, '')}")
+            if g.get("w"):
+                print(f"{'':>12}frame {' '.join(g['w'])}")
 
 
 if __name__ == "__main__":
