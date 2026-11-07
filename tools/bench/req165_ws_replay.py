@@ -9,7 +9,7 @@ with a preset save (`psave`). This script sends:
 Looks are copied from the board after you tap your own views in the app (step 1).
 
 Python 3 standard library only. Nothing secret is read or sent. Usage:
-  python3 tools/bench/req165_ws_replay.py [--host lumen-b4170c.local] [--looks 4] [--steps 8]
+  python3 tools/bench/req165_ws_replay.py [--rounds 1,2] [--host lumen-b4170c.local] [--looks 4] [--steps 8]
 """
 import argparse
 import base64
@@ -19,6 +19,13 @@ import socket
 import struct
 import time
 import urllib.request
+
+ROUNDS = {
+    "1": "the app's Wi-Fi message only",
+    "2": "the app's message, then a second copy 300 ms later with a preset save",
+    "3": "the app's message, then a second copy 300 ms later without a save",
+    "4": "the app's message, then only a preset save 300 ms later",
+}
 
 SEG_KEYS = ("fx", "pal", "col", "sx", "ix", "bri", "mi", "rev")  # contracts/api.md "Added by the server"
 MAX_SEG_ID = 15
@@ -92,63 +99,82 @@ def ask(prompt):
     return input(f"\n{prompt}\n> ").strip()
 
 
-def run_round(ws, looks, steps, with_save):
+def run_round(ws, looks, steps, rnd):
+    save = {"psave": BENCH_SLOT, "sb": True, "n": "REQ-165 bench"}
     for n in range(steps):
         patch = looks[n % len(looks)]
         ws.send(patch)
-        if with_save:
-            time.sleep(0.3)
-            ws.send(dict(patch, psave=BENCH_SLOT, sb=True, n="REQ-165 bench"))
-            time.sleep(1.7)
-        else:
+        if rnd == "1":
             time.sleep(2.0)
+        else:
+            time.sleep(0.3)
+            ws.send({"2": dict(patch, **save), "3": patch, "4": save}[rnd])
+            time.sleep(1.7)
         print(f"  look {n + 1}/{steps} sent")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--host", default="lumen-b4170c.local")
+    ap.add_argument("--rounds", default="1,2", help="rounds to run, in order (default 1,2; all: 1,2,3,4)")
     ap.add_argument("--looks", type=int, default=4, help="views to copy from the board (default 4)")
     ap.add_argument("--steps", type=int, default=8, help="looks sent per round (default 8)")
+    ap.add_argument("--looks-file", default="/tmp/req165-looks.json", help="where copied views are kept")
     a = ap.parse_args()
+    rounds = [r.strip() for r in a.rounds.split(",") if r.strip()]
+    if not rounds or any(r not in ROUNDS for r in rounds):
+        raise SystemExit("--rounds takes numbers from 1 to 4, e.g. 3,4")
 
     info = get_json(a.host, "/json/info")
     length = info["leds"]["count"]
-    print(f"Board {info.get('name')} at {a.host}: firmware {info.get('lumen', {}).get('fw')}, length {length}.")
+    fw = info.get("lumen", {}).get("fw")
+    print(f"Board {info.get('name')} at {a.host}: firmware {fw}, length {length}.")
 
-    print("\nStep 1: copy your views from the board.")
     looks = []
-    for i in range(a.looks):
-        ask(f"In Lumen, tap a bright view ({'Party first' if i == 0 else 'a different one'}), "
-            f"wait 3 s, then press Enter. ({i + 1} of {a.looks})")
-        looks.append(app_patch(get_json(a.host, "/json/state"), length))
-        print(f"  copied: effect {looks[-1]['seg'][0].get('fx')}, brightness {looks[-1]['bri']}")
+    if os.path.exists(a.looks_file):
+        if ask(f"Use the views copied last time ({a.looks_file})? Type y or n.").lower().startswith("y"):
+            with open(a.looks_file) as f:
+                looks = json.load(f)
+            for look in looks:  # the length may have changed since
+                if len([s for s in look["seg"] if s.get("stop", 0) > 0]) == 1:
+                    look["seg"][0]["stop"] = length
+    if not looks:
+        print("\nStep 1: copy your views from the board.")
+        for i in range(a.looks):
+            ask(f"In Lumen, tap a bright view ({'Party first' if i == 0 else 'a different one'}), "
+                f"wait 3 s, then press Enter. ({i + 1} of {a.looks})")
+            looks.append(app_patch(get_json(a.host, "/json/state"), length))
+            print(f"  copied: effect {looks[-1]['seg'][0].get('fx')}, brightness {looks[-1]['bri']}")
+        with open(a.looks_file, "w") as f:
+            json.dump(looks, f)
 
     ask("Step 2: close Lumen fully (swipe it away). Then unplug the strip's power, wait 5 s and plug it "
         "back in. Wait until the strip shows its look again, check LEDs 321 and up are dark, then press Enter.")
     print(f"  WLED /ws clients now: {get_json(a.host, '/json/info').get('ws')} (the app closed: expect 1 or 0)")
 
-    ws = Ws(a.host)
+    results = []
+    ws = None
     try:
-        print("\nRound 1: the app's Wi-Fi message only, a new look every 2 s.")
-        run_round(ws, looks, a.steps, with_save=False)
-        r1 = ask("Round 1: were LEDs past the length lit or dark? Type lit or dark.")
-
-        ask("Unplug the strip's power, wait 5 s, plug it back in, wait for its look, check the LEDs past "
-            "the length are dark, then press Enter.")
-        ws.close()
-        ws = Ws(a.host)
-        print("\nRound 2: the app's message, then a second copy 300 ms later with a preset save.")
-        run_round(ws, looks, a.steps, with_save=True)
-        r2 = ask("Round 2: were LEDs past the length lit or dark? Type lit or dark.")
-
-        ws.send({"pdel": BENCH_SLOT})
-        print(f"  bench preset {BENCH_SLOT} deleted.")
+        for i, rnd in enumerate(rounds):
+            if i > 0:
+                ask("Unplug the strip's power, wait 5 s, plug it back in, wait for its look, check the LEDs "
+                    "past the length are dark, then press Enter.")
+            ws = Ws(a.host)
+            print(f"\nRound {rnd}: {ROUNDS[rnd]}, a new look every 2 s.")
+            run_round(ws, looks, a.steps, rnd)
+            results.append(f"round {rnd} " + ask(f"Round {rnd}: were LEDs past the length lit or dark? "
+                                                 "Type lit or dark."))
+            ws.close()
+            ws = None
+        if any(r in ("2", "4") for r in rounds):
+            ws = Ws(a.host)
+            ws.send({"pdel": BENCH_SLOT})
+            print(f"  bench preset {BENCH_SLOT} deleted.")
     finally:
-        ws.close()
+        if ws:
+            ws.close()
 
-    print(f"\nResult to send back: round 1 (Wi-Fi only) {r1}; round 2 (Wi-Fi + preset save copy) {r2}; "
-          f"firmware {info.get('lumen', {}).get('fw')}, length {length}.")
+    print(f"\nResult to send back: {'; '.join(results)}; firmware {fw}, length {length}.")
 
 
 if __name__ == "__main__":
