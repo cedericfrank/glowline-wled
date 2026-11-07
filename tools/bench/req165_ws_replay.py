@@ -95,6 +95,40 @@ def app_patch(state, length):
     return {"on": True, "bri": state.get("bri", 128), "seg": segs}
 
 
+def post_length(host, ins0, n):
+    """What the app's length save sends: hw.led total and ins[0] (as read from the board) with len n."""
+    body = json.dumps({"hw": {"led": {"total": n, "ins": [dict(ins0, len=n)]}}}).encode()
+    req = urllib.request.Request(f"http://{host}/json/cfg", data=body, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=8) as r:
+        r.read()
+
+
+def length_test(host, cycles, full):
+    cfg = get_json(host, "/json/cfg")
+    ins0 = cfg["hw"]["led"]["ins"][0]
+    original = ins0["len"]
+    shorts = [408, 320, 400, 350, 450, 300, 380, 420]
+    ask(f"Length test: in Lumen, tap a bright view, then close Lumen fully (swipe it away). The strip is "
+        f"now {original} LEDs; it goes back to {original} at the end. Press Enter to start.")
+    lit = []
+    try:
+        for n in range(cycles):
+            short = shorts[n % len(shorts)]
+            post_length(host, ins0, full)
+            time.sleep(3)
+            post_length(host, ins0, short)
+            time.sleep(3)
+            ans = ask(f"Change {n + 1}/{cycles}: length {full} -> {short}. Any LEDs lit from {short + 1} on? "
+                      "Press Enter if all dark, or type how many are lit (e.g. 7).")
+            if ans and ans != "0":
+                lit.append(f"{short}: {ans} lit")
+    finally:
+        post_length(host, ins0, original)
+        print(f"  length back to {original}.")
+    return f"length test {len(lit)} of {cycles} left LEDs lit" + (f" ({'; '.join(lit)})" if lit else "")
+
+
 def ask(prompt):
     return input(f"\n{prompt}\n> ").strip()
 
@@ -120,7 +154,17 @@ def main():
     ap.add_argument("--looks", type=int, default=4, help="views to copy from the board (default 4)")
     ap.add_argument("--steps", type=int, default=8, help="looks sent per round (default 8)")
     ap.add_argument("--looks-file", default="/tmp/req165-looks.json", help="where copied views are kept")
+    ap.add_argument("--length-test", type=int, default=0, metavar="N",
+                    help="change the length N times instead of the rounds (see the top of this file)")
+    ap.add_argument("--full", type=int, default=480, help="the strip's real LED count (default 480)")
     a = ap.parse_args()
+    if a.length_test:
+        info = get_json(a.host, "/json/info")
+        fw = info.get("lumen", {}).get("fw")
+        print(f"Board {info.get('name')} at {a.host}: firmware {fw}, length {info['leds']['count']}.")
+        result = length_test(a.host, a.length_test, a.full)
+        print(f"\nResult to send back: {result}; firmware {fw}.")
+        return
     rounds = [r.strip() for r in a.rounds.split(",") if r.strip()]
     if not rounds or any(r not in ROUNDS for r in rounds):
         raise SystemExit("--rounds takes numbers from 1 to 4, e.g. 3,4")
