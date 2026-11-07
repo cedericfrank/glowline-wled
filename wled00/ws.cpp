@@ -20,6 +20,97 @@ static unsigned long wsLastLiveTime = 0;
 
 #define WS_LIVE_INTERVAL 40
 
+// Applies one whole JSON text message from a /ws client: the state change and the reply.
+// client may be nullptr (GLOWLINE_WS_STATE_IN_LOOP: it disconnected while its message waited);
+// the state is still applied, only the reply is skipped.
+static void wsHandleText(AsyncWebSocketClient * client, uint8_t *data, size_t len)
+{
+  bool verboseResponse = false;
+  if (!requestJSONBufferLock(JSON_LOCK_WS_RECEIVE)) {
+    if (client) client->text(F("{\"error\":3}")); // ERR_NOBUF
+    return;
+  }
+
+  DeserializationError error = deserializeJson(*pDoc, data, len);
+  JsonObject root = pDoc->as<JsonObject>();
+  if (error || root.isNull()) {
+    releaseJSONBufferLock();
+    return;
+  }
+  if (root["v"] && root.size() == 1) {
+    //if the received value is just "{"v":true}", send only to this client
+    verboseResponse = true;
+  } else if (root.containsKey("lv")) {
+    if (client) wsLiveClientId = root["lv"] ? client->id() : 0;
+  } else {
+    verboseResponse = deserializeState(root);
+  }
+  releaseJSONBufferLock();
+
+  // client is never nullptr in stock WLED; sendDataWs(nullptr) would broadcast to every client
+  if (client && !interfaceUpdateCallMode) { // individual client response only needed if no WS broadcast soon
+    if (verboseResponse) {
+      #ifndef WLED_DISABLE_MQTT
+      // publish state to MQTT as requested in wled#4643 even if only WS response selected
+      publishMqtt();
+      #endif
+      sendDataWs(client);
+    } else {
+      // we have to send something back otherwise WS connection closes
+      client->text(F("{\"success\":true}"));
+    }
+    // force broadcast in 500ms after updating client
+    //lastInterfaceUpdate = millis() - (INTERFACE_UPDATE_COOLDOWN -500); // ESP8266 does not like this
+  }
+}
+
+#ifdef GLOWLINE_WS_STATE_IN_LOOP
+// Lumen (REQ-165): /ws JSON messages are applied in the main loop, not in the AsyncTCP task that
+// receives them. On the S3's RMT LED output, the app's look changes applied from the AsyncTCP task
+// made frames run past the set length, lighting LEDs past it (bench 2026-11-07, Lumen-170c at 320 of
+// 480: lit from /ws, dark when the same look came from the server, which the usermod applies in the
+// loop). The exact stall wasn't found in the source; applying in the loop matches the dark path.
+// Each message is copied here and handled in order by handleWs(), with the same lock and reply.
+struct GlowlineWsMsg {
+  uint32_t client;
+  size_t len;
+  uint8_t data[];
+};
+static constexpr UBaseType_t GLOWLINE_WS_QUEUE_LEN = 4; // the app sends at most one patch per 16 ms
+static QueueHandle_t glowlineWsQueue = nullptr;         // created by handleWs() (loop task) on its first run
+
+// Called from the AsyncTCP task. False: no queue yet (handle it there, as stock WLED does).
+static bool glowlineWsEnqueue(AsyncWebSocketClient * client, const uint8_t *data, size_t len)
+{
+  QueueHandle_t q = glowlineWsQueue;
+  if (!q) return false;
+  GlowlineWsMsg *msg = static_cast<GlowlineWsMsg*>(p_malloc(sizeof(GlowlineWsMsg) + len));
+  if (msg) {
+    msg->client = client->id();
+    msg->len = len;
+    memcpy(msg->data, data, len);
+    if (xQueueSend(q, &msg, 0) == pdTRUE) return true;
+    p_free(msg);
+  }
+  client->text(F("{\"error\":3}")); // ERR_NOBUF, as when the JSON buffer is busy
+  return true;
+}
+
+// Called from handleWs() in the loop task.
+static void glowlineWsDrain()
+{
+  if (!glowlineWsQueue) {
+    glowlineWsQueue = xQueueCreate(GLOWLINE_WS_QUEUE_LEN, sizeof(GlowlineWsMsg*));
+    return;
+  }
+  GlowlineWsMsg *msg = nullptr;
+  while (xQueueReceive(glowlineWsQueue, &msg, 0) == pdTRUE) {
+    wsHandleText(ws.client(msg->client), msg->data, msg->len);
+    p_free(msg);
+  }
+}
+#endif
+
 void wsEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len)
 {
   if(type == WS_EVT_CONNECT){
@@ -44,42 +135,10 @@ void wsEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventTyp
           return;
         }
 
-        bool verboseResponse = false;
-        if (!requestJSONBufferLock(JSON_LOCK_WS_RECEIVE)) {
-          client->text(F("{\"error\":3}")); // ERR_NOBUF
-          return;
-        }
-
-        DeserializationError error = deserializeJson(*pDoc, data, len);
-        JsonObject root = pDoc->as<JsonObject>();
-        if (error || root.isNull()) {
-          releaseJSONBufferLock();
-          return;
-        }
-        if (root["v"] && root.size() == 1) {
-          //if the received value is just "{"v":true}", send only to this client
-          verboseResponse = true;
-        } else if (root.containsKey("lv")) {
-          wsLiveClientId = root["lv"] ? client->id() : 0;
-        } else {
-          verboseResponse = deserializeState(root);
-        }
-        releaseJSONBufferLock();
-
-        if (!interfaceUpdateCallMode) { // individual client response only needed if no WS broadcast soon
-          if (verboseResponse) {
-            #ifndef WLED_DISABLE_MQTT
-            // publish state to MQTT as requested in wled#4643 even if only WS response selected
-            publishMqtt();
-            #endif
-            sendDataWs(client);
-          } else {
-            // we have to send something back otherwise WS connection closes
-            client->text(F("{\"success\":true}"));
-          }
-          // force broadcast in 500ms after updating client
-          //lastInterfaceUpdate = millis() - (INTERFACE_UPDATE_COOLDOWN -500); // ESP8266 does not like this
-        }
+#ifdef GLOWLINE_WS_STATE_IN_LOOP
+        if (glowlineWsEnqueue(client, data, len)) return;
+#endif
+        wsHandleText(client, data, len);
       } else if (info->opcode == WS_BINARY) {
         // first byte determines protocol. Note: since e131_packet_t is "packed", the compiler handles alignment issues
         //DEBUG_PRINTF_P(PSTR("WS binary message: len %u, byte0: %u\n"), len, data[0]);
@@ -244,6 +303,9 @@ static bool sendLiveLedsWs(uint32_t wsClient)
 
 void handleWs()
 {
+#ifdef GLOWLINE_WS_STATE_IN_LOOP
+  glowlineWsDrain();
+#endif
   if (millis() - wsLastLiveTime > WS_LIVE_INTERVAL)
   {
     #ifdef ESP8266
