@@ -125,6 +125,9 @@ void updateFSInfo();
 size_t getFsBytesUsed();
 size_t getFsBytesTotal();
 void closeFile();
+#ifdef GLOWLINE_FS_WAITS_FOR_STRIP
+void glowlineWaitForStripBeforeFlash();
+#endif
 inline bool writeObjectToFileUsingId(const String &file, uint16_t id, const JsonDocument* content) { return writeObjectToFileUsingId(file.c_str(), id, content); };
 inline bool writeObjectToFile(const String &file, const char* key, const JsonDocument* content) { return writeObjectToFile(file.c_str(), key, content); };
 inline bool readObjectFromFileUsingId(const String &file, uint16_t id, JsonDocument* dest, const JsonDocument* filter = nullptr) { return readObjectFromFileUsingId(file.c_str(), id, dest); };

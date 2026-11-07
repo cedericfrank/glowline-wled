@@ -828,6 +828,10 @@ bool deserializeConfigFromFS() {
 }
 
 void serializeConfigToFS() {
+  #ifdef GLOWLINE_FS_WAITS_FOR_STRIP
+  // runs right after strip.service() in the loop; wsec.json, the backup and cfg.json all write flash (REQ-165)
+  glowlineWaitForStripBeforeFlash();
+  #endif
   serializeConfigSec();
   backupConfig(); // backup before writing new config
 

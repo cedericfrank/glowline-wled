@@ -42,8 +42,23 @@ static volatile size_t knownLargestSpace = MAX_SPACE;
 
 static File f; // don't export to other cpp files
 
+#ifdef GLOWLINE_FS_WAITS_FOR_STRIP
+// Lumen (REQ-165): wait until no frame is on the LED line before writing to flash. A flash write turns
+// the cache off, which stalls the S3's RMT refill interrupt mid-frame; the frame then runs past the set
+// length and lights LEDs past it. WLED's own preset save waits the same way (presets.cpp doSaveState()),
+// but its deferred close of presets.json (wled.cpp loop, after strip.service() has started a frame) and
+// the cfg.json write did not. Bench 2026-11-07, Lumen-170c at 320 of 480: a psave lit LEDs 321-480.
+void glowlineWaitForStripBeforeFlash() {
+  const unsigned long start = millis();
+  while (strip.isUpdating() && millis() - start < 50) delay(1);
+}
+#endif
+
 //wrapper to find out how long closing takes
 void closeFile() {
+  #ifdef GLOWLINE_FS_WAITS_FOR_STRIP
+  glowlineWaitForStripBeforeFlash(); // LittleFS writes cached data to flash on close
+  #endif
   #ifdef WLED_DEBUG_FS
     DEBUGFS_PRINT(F("Close -> "));
     uint32_t s = millis();
