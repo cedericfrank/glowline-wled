@@ -128,6 +128,21 @@ void closeFile();
 #ifdef GLOWLINE_FS_WAITS_FOR_STRIP
 void glowlineWaitForStripBeforeFlash();
 #endif
+#ifdef GLOWLINE_BENCH_ISR_GAP
+// Bench probe (REQ-165, usermods/glowline/glowline_isrgap.h): which part of WLED's loop is running,
+// so a recorded interrupt hold-off can be placed. Set only from the loop task.
+enum GlowlineLoopPhase : uint8_t { GLP_OTHER, GLP_TRANSITIONS, GLP_USERMODS, GLP_CLOSEFILE, GLP_PRESETS, GLP_SERVICE, GLP_CFGWRITE, GLP_WS, GLP_WS_STATE, GLP_WS_LIVE };
+extern volatile uint8_t glowlineIsrGapPhase;
+extern void* glowlineIsrGapLoopTask;
+struct GlowlinePhaseScope {
+  uint8_t prev; bool own;
+  GlowlinePhaseScope(uint8_t p) : prev(glowlineIsrGapPhase), own((void*)xTaskGetCurrentTaskHandle() == glowlineIsrGapLoopTask) { if (own) glowlineIsrGapPhase = p; }
+  ~GlowlinePhaseScope() { if (own) glowlineIsrGapPhase = prev; }
+};
+#define GLOWLINE_PHASE(p) GlowlinePhaseScope glowlinePhaseScope_(p)
+#else
+#define GLOWLINE_PHASE(p)
+#endif
 inline bool writeObjectToFileUsingId(const String &file, uint16_t id, const JsonDocument* content) { return writeObjectToFileUsingId(file.c_str(), id, content); };
 inline bool writeObjectToFile(const String &file, const char* key, const JsonDocument* content) { return writeObjectToFile(file.c_str(), key, content); };
 inline bool readObjectFromFileUsingId(const String &file, uint16_t id, JsonDocument* dest, const JsonDocument* filter = nullptr) { return readObjectFromFileUsingId(file.c_str(), id, dest); };

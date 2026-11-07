@@ -191,6 +191,7 @@ void wsEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventTyp
 
 void sendDataWs(AsyncWebSocketClient * client)
 {
+  GLOWLINE_PHASE(GLP_WS_STATE);
   if (!ws.count()) return;
 
   if (!requestJSONBufferLock(JSON_LOCK_WS_SEND)) {
@@ -244,6 +245,7 @@ void sendDataWs(AsyncWebSocketClient * client)
 
 static bool sendLiveLedsWs(uint32_t wsClient)
 {
+  GLOWLINE_PHASE(GLP_WS_LIVE);
   AsyncWebSocketClient * wsc = ws.client(wsClient);
   if (!wsc || wsc->queueLength() > 0) return false; //only send if queue free
 

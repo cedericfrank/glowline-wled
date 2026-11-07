@@ -93,7 +93,7 @@ void WLED::loop()
   #endif
   handleImprovWifiScan();
   handleNotifications();
-  handleTransitions();
+  { GLOWLINE_PHASE(GLP_TRANSITIONS); handleTransitions(); }
   #ifdef WLED_ENABLE_DMX
   handleDMXOutput();
   #endif
@@ -105,7 +105,7 @@ void WLED::loop()
   unsigned long usermodMillis = millis();
   #endif
   userLoop();
-  UsermodManager::loop();
+  { GLOWLINE_PHASE(GLP_USERMODS); UsermodManager::loop(); }
   #ifdef WLED_DEBUG
   usermodMillis = millis() - usermodMillis;
   avgUsermodMillis += usermodMillis;
@@ -125,7 +125,7 @@ void WLED::loop()
   #endif
 
   if (doCloseFile) {
-    closeFile();
+    { GLOWLINE_PHASE(GLP_CLOSEFILE); closeFile(); }
     yield();
   }
 
@@ -150,11 +150,11 @@ void WLED::loop()
       handlePlaylist();
       yield();
     }
-    handlePresets();
+    { GLOWLINE_PHASE(GLP_PRESETS); handlePresets(); }
     yield();
 
     if (!offMode || strip.isOffRefreshRequired() || strip.needsUpdate())
-      strip.service();
+      { GLOWLINE_PHASE(GLP_SERVICE); strip.service(); }
     #ifdef ESP8266
     else if (!noWifiSleep)
       delay(1); //required to make sure ESP enters modem sleep (see #1184)
@@ -258,10 +258,10 @@ void WLED::loop()
     loadLedmap = -1;
   }
   yield();
-  if (configNeedsWrite) serializeConfigToFS();
+  if (configNeedsWrite) { GLOWLINE_PHASE(GLP_CFGWRITE); serializeConfigToFS(); }
 
   yield();
-  handleWs();
+  { GLOWLINE_PHASE(GLP_WS); handleWs(); }
 #if defined(STATUSLED)
   handleStatusLED();
 #endif

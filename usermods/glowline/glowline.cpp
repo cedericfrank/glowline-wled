@@ -18,6 +18,11 @@
 #include "glowline_cue.h"
 #include "glowline_scan.h"
 #include "glowline_wrongpw.h"
+#ifdef GLOWLINE_BENCH_ISR_GAP
+volatile uint8_t glowlineIsrGapPhase = GLP_OTHER;
+void* glowlineIsrGapLoopTask = nullptr;
+#include "glowline_isrgap.h" // bench probe for the LED refill interrupt's hold-offs (REQ-165); never shipped
+#endif
 #include <memory>
 #include <new>
 #include "esp_system.h"
@@ -2381,6 +2386,9 @@ class GlowlineUsermod : public Usermod {
 #ifdef GLOWLINE_SERIAL_PROVISION
       burnInSetup(); // a burn-in power-up replaces the boot cue
 #endif
+#ifdef GLOWLINE_BENCH_ISR_GAP
+      GlowlineIsrGap::begin();
+#endif
     }
 
     // Keeps the data line low for GLOWLINE_LED_LATCH_US between two frames (REQ-165). The S3's RMT
@@ -2448,6 +2456,9 @@ class GlowlineUsermod : public Usermod {
     // WLED's effect engine and whatever segment/effect state underlies it.
     void handleOverlayDraw() {
       waitForLatchGap();
+#ifdef GLOWLINE_BENCH_ISR_GAP
+      GlowlineIsrGap::stampShow(); // the frame goes on the line right after this returns
+#endif
 #ifdef GLOWLINE_SERIAL_PROVISION
       if (burnInRun || burnInShowFailed) {
         uint16_t n = strip.getLengthTotal();
@@ -2496,6 +2507,9 @@ class GlowlineUsermod : public Usermod {
 #endif
       }
       advanceBootCue();
+#ifdef GLOWLINE_BENCH_ISR_GAP
+      GlowlineIsrGap::loopMeasure();
+#endif
 #ifdef GLOWLINE_IMPROV_BLE
       tickIdentify();
       bleTick();
@@ -2949,6 +2963,9 @@ class GlowlineUsermod : public Usermod {
       lumen[F("fw")] = F(GLOWLINE_FW_VERSION);
       lumen[F("device")] = wsDeviceId;
       lumen[F("reset")] = resetReasonName(); // why this boot started (REQ-140; also &rst= on /ws)
+#ifdef GLOWLINE_BENCH_ISR_GAP
+      GlowlineIsrGap::report(lumen); // lumen.probe: the LED refill interrupt's hold-offs (REQ-165)
+#endif
       JsonArray caps = lumen.createNestedArray(F("caps"));
 #ifdef GLOWLINE_SERIAL_PROVISION
       caps.add(F("serial_prov")); // REQ-129: the flasher checks this before provisioning
