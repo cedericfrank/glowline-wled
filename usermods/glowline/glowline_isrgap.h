@@ -33,6 +33,8 @@
 
 namespace GlowlineIsrGap {
 
+static constexpr uint8_t BT = 14;
+
 struct Gap {
   uint32_t us;        // the hold-off: time between two ticks, nominally 40
   uint32_t ms;        // millis() when it ended
@@ -43,15 +45,15 @@ struct Gap {
   char other[12];     // the task running on the other core at that moment (a flash op from core 0 shows there)
   uint32_t epc1;      // EPC1 as read in the handler (may be overwritten by a window exception on the way in)
   uint32_t w[6];      // the first words at the TCB's pxTopOfStack: exit, pc, ps, a0, a1, a2 if it is an XtExcFrame
-  uint32_t bt[8];     // the interrupted task's return addresses, innermost first (esp_backtrace_get_next_frame)
+  uint32_t bt[BT];    // the interrupted task's return addresses, innermost first (esp_backtrace_get_next_frame)
 };
-static constexpr uint8_t BT = 14;
 
 static constexpr uint32_t TICK_US = 40;
 static constexpr uint32_t REPORT_US = 100;
 static constexpr uint8_t RING = 6;
 
 static hw_timer_t* timer = nullptr;
+static bool disabled = false;              // /isrgap.off was found at start: no probe this boot
 static volatile int64_t lastTick = 0;
 static volatile int64_t lastShow = 0;
 static volatile uint32_t frameUs = 0;      // how long a frame is on the line, from the strip length
@@ -152,6 +154,8 @@ static void IRAM_ATTR tick() {
 // CONFIG_ARDUINO_RUNNING_CORE, so the timer's interrupt lands on the core the LED refill interrupt is on).
 static void begin() {
   if (timer || millis() < 20000) return;
+  if (disabled) return;
+  if (WLED_FS.exists("/isrgap.off")) { disabled = true; Serial.println(F("glowline isrgap: /isrgap.off exists, probe off")); return; } // escape hatch: upload the file, reboot
   glowlineIsrGapLoopTask = xTaskGetCurrentTaskHandle();
   timer = timerBegin(1000000);
   if (!timer) { Serial.println(F("glowline isrgap: no timer")); return; }
