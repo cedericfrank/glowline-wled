@@ -229,6 +229,25 @@ extern "C" bool verifyRollbackLater() {
 }
 #endif
 
+#ifdef GLOWLINE_RMT_DMA
+// REQ-165 (1.19.5): the lumen envs' NeoPixelBus copy is patched at build time
+// (pio-scripts/glowline_rmt_dma.py) to give the LED output a DMA-fed RMT channel with
+// GLOWLINE_RMT_DMA symbols, falling back to 1024 and then to the stock channel if the driver refuses
+// it. Its Initialize() calls this with what it got; /json/info -> lumen.rmt reports it, so a bench
+// can tell the DMA path is live (or why not) without the serial port. Called from setup() and
+// from the loop on a live length change (the output is rebuilt), never from an interrupt.
+static bool glowlineRmtDma = false;
+static unsigned glowlineRmtSymbols = 0;
+static esp_err_t glowlineRmtErr = ESP_OK;
+void glowlineRmtChannelCreated(bool dma, unsigned symbols, esp_err_t err) {
+  glowlineRmtDma = dma;
+  glowlineRmtSymbols = symbols;
+  glowlineRmtErr = err;
+  Serial.printf("glowline rmt: channel %s, %u symbols, %s\n", dma ? "with DMA" : "without DMA", symbols,
+                esp_err_to_name(err));
+}
+#endif
+
 #if defined(GLOWLINE_SERIAL_PROVISION) && !defined(GLOWLINE_AP_PASS_FROM_NVS)
 #error "GLOWLINE_SERIAL_PROVISION needs GLOWLINE_AP_PASS_FROM_NVS (it writes the hotspot passphrase that flag reads)"
 #endif
@@ -2961,8 +2980,19 @@ class GlowlineUsermod : public Usermod {
       lumen[F("fw")] = F(GLOWLINE_FW_VERSION);
       lumen[F("device")] = wsDeviceId;
       lumen[F("reset")] = resetReasonName(); // why this boot started (REQ-140; also &rst= on /ws)
+      // Lowest free internal heap since boot, bytes (heap_caps_get_minimum_free_size): the bench's heap
+      // check after a BLE setup or a TLS connect without a serial cable (REQ-165 1.19.5 bench, contract S-b).
+      lumen[F("heap_min")] = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
 #ifdef GLOWLINE_BENCH_ISR_GAP
       GlowlineIsrGap::report(lumen); // lumen.probe: the LED refill interrupt's hold-offs (REQ-165)
+#endif
+#ifdef GLOWLINE_RMT_DMA
+      // lumen.rmt: the LED output's RMT channel as the driver granted it (REQ-165, 1.19.5):
+      // {"dma":true,"symbols":2000} is the intended configuration; "err" only when creation failed.
+      JsonObject rmt = lumen.createNestedObject(F("rmt"));
+      rmt[F("dma")] = glowlineRmtDma;
+      rmt[F("symbols")] = glowlineRmtSymbols;
+      if (glowlineRmtErr != ESP_OK) rmt[F("err")] = esp_err_to_name(glowlineRmtErr);
 #endif
       JsonArray caps = lumen.createNestedArray(F("caps"));
 #ifdef GLOWLINE_SERIAL_PROVISION
