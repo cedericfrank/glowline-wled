@@ -44,11 +44,11 @@ struct Gap {
   uint32_t w[6];      // the first words at the TCB's pxTopOfStack: exit, pc, ps, a0, a1, a2 if it is an XtExcFrame
   uint32_t bt[8];     // the interrupted task's return addresses, innermost first (esp_backtrace_get_next_frame)
 };
-static constexpr uint8_t BT = 8;
+static constexpr uint8_t BT = 14;
 
 static constexpr uint32_t TICK_US = 40;
 static constexpr uint32_t REPORT_US = 100;
-static constexpr uint8_t RING = 8;
+static constexpr uint8_t RING = 6;
 
 static hw_timer_t* timer = nullptr;
 static volatile int64_t lastTick = 0;
@@ -190,10 +190,6 @@ static void addGap(JsonArray& arr, const Gap& g) {
   o["task"] = g.task;
   o["other"] = g.other;
   o["ph"] = phaseName(g.phase);
-  snprintf(pc, sizeof(pc), "0x%08lx", (unsigned long)g.epc1);
-  o["epc1"] = pc;
-  JsonArray w = o.createNestedArray("w");
-  for (uint8_t i = 0; i < 6; i++) { snprintf(pc, sizeof(pc), "0x%08lx", (unsigned long)g.w[i]); w.add(pc); }
   JsonArray bt = o.createNestedArray("bt");
   for (uint8_t i = 0; i < BT && g.bt[i]; i++) { snprintf(pc, sizeof(pc), "0x%08lx", (unsigned long)g.bt[i]); bt.add(pc); }
   if (g.sinceShow != 0xFFFFFFFFu) o["show"] = g.sinceShow;
