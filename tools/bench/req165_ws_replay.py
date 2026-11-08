@@ -129,8 +129,14 @@ def length_test(host, cycles, full):
             time.sleep(3)
             post_length(host, ins0, short)
             time.sleep(3)
-            ans = ask(f"Change {n + 1}/{cycles}: length {full} -> {short}. Any LEDs lit from {short + 1} on? "
-                      "Press Enter if all dark, or type how many are lit (e.g. 7).")
+            # Only Enter/0 (dark) or a count of lit LEDs is accepted; anything else (a stray key: a "\\"
+            # once counted as "1 lit", REQ-165 bench 1.19.5) is asked again.
+            while True:
+                ans = ask(f"Change {n + 1}/{cycles}: length {full} -> {short}. Any LEDs lit from {short + 1} on? "
+                          "Press Enter if all dark, or type how many are lit (e.g. 7).")
+                if ans == "" or ans.isdigit():
+                    break
+                print(f"  '{ans}' is not a count. Press Enter for dark, or type a number.")
             if ans and ans != "0":
                 lit.append(f"{short}: {ans} lit")
     finally:
