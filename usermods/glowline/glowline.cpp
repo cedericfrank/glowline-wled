@@ -2386,9 +2386,6 @@ class GlowlineUsermod : public Usermod {
 #ifdef GLOWLINE_SERIAL_PROVISION
       burnInSetup(); // a burn-in power-up replaces the boot cue
 #endif
-#ifdef GLOWLINE_BENCH_ISR_GAP
-      GlowlineIsrGap::begin();
-#endif
     }
 
     // Keeps the data line low for GLOWLINE_LED_LATCH_US between two frames (REQ-165). The S3's RMT
@@ -2508,6 +2505,7 @@ class GlowlineUsermod : public Usermod {
       }
       advanceBootCue();
 #ifdef GLOWLINE_BENCH_ISR_GAP
+      GlowlineIsrGap::begin(); // once, 20 s after boot
       GlowlineIsrGap::loopMeasure();
 #endif
 #ifdef GLOWLINE_IMPROV_BLE

@@ -29,6 +29,7 @@
 #include "xtensa_context.h"
 #include "esp_debug_helpers.h"
 #include "esp_cpu.h"
+#include "esp_memory_utils.h"
 
 namespace GlowlineIsrGap {
 
@@ -111,11 +112,17 @@ static void IRAM_ATTR tick() {
     g.pc = top[1];
     // Walk the interrupted task's stack the way the panic handler does from an exception frame: the
     // vector spilled its register windows, so each frame's base save area holds the caller's a0/a1.
-    esp_backtrace_frame_t fr = { .pc = top[1], .sp = top[4], .next_pc = top[3], .exc_frame = nullptr };
+    // Only if it is an exception frame: a tick that lands inside a context switch finds a solicited
+    // frame there instead, whose words are not exit/pc/ps/a0/a1 (isrgap4 crashed on that).
     for (uint8_t i = 0; i < BT; i++) g.bt[i] = 0;
-    for (uint8_t i = 0; i < BT && fr.next_pc; i++) {
-      if (!esp_backtrace_get_next_frame(&fr)) break;
-      g.bt[i] = (uint32_t)esp_cpu_pc_to_addr(fr.pc);
+    const bool looksLikeExcFrame = esp_ptr_executable((void*)top[0]) && esp_ptr_executable(esp_cpu_pc_to_addr(top[1]))
+                                   && (top[2] & 0x20) /* PS.UM */ && esp_stack_ptr_is_sane(top[4]);
+    if (looksLikeExcFrame) {
+      esp_backtrace_frame_t fr = { .pc = top[1], .sp = top[4], .next_pc = top[3], .exc_frame = nullptr };
+      for (uint8_t i = 0; i < BT && fr.next_pc; i++) {
+        if (!esp_backtrace_get_next_frame(&fr)) break;
+        g.bt[i] = (uint32_t)esp_cpu_pc_to_addr(fr.pc);
+      }
     }
     copyName(g.task, sizeof(g.task), pcTaskGetName(t));
   }
@@ -141,9 +148,10 @@ static void IRAM_ATTR tick() {
   }
 }
 
-// From the usermod's setup(): the loop task, core 1 (CONFIG_ARDUINO_RUNNING_CORE), so the timer's
-// interrupt lands on the core the LED refill interrupt is on.
+// From the usermod's loop(), 20 s after boot (past the boot churn, and the loop task, core 1,
+// CONFIG_ARDUINO_RUNNING_CORE, so the timer's interrupt lands on the core the LED refill interrupt is on).
 static void begin() {
+  if (timer || millis() < 20000) return;
   glowlineIsrGapLoopTask = xTaskGetCurrentTaskHandle();
   timer = timerBegin(1000000);
   if (!timer) { Serial.println(F("glowline isrgap: no timer")); return; }
